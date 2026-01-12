@@ -77,7 +77,7 @@ class Args:
     """High lambda for the residual head targets (low bias, higher variance)"""
     rbc_lr_scale: float = 0.1
     """Learning rate scale for the residual head (implements the slow time-scale)"""
-    rbc_warmup_frac: float = 0.5
+    rbc_warmup_frac: float = 0.2
     """Fraction of total timesteps to freeze the residual head (Freeze-and-Fine-Tune)"""
 
     # to be filled in runtime
@@ -186,7 +186,7 @@ class Agent(nn.Module):
                 nn.Tanh(),
                 layer_init(nn.Linear(64, 64)),
                 nn.Tanh(),
-                layer_init(nn.Linear(64, 1), std=1.0),
+                layer_init(nn.Linear(64, 1), std=0.5),
             )
 
     def get_value(self, x):
@@ -484,6 +484,12 @@ if __name__ == "__main__":
             mean_res = b_values.mean().item() - b_values_td.mean().item()
             mean_td = b_values_td.mean().item()
             writer.add_scalar("rbc/bias_fraction", mean_res / (abs(mean_td) + 1e-6), global_step)
+            # Log correlation between Residual and Return Error
+            residual_vals = b_values - b_values_td # effectively R_phi
+            td_error = b_returns - b_values_td
+            # If R_phi predicts the TD error, this correlation should be positive
+            corr = torch.corrcoef(torch.stack((residual_vals, td_error)))[0, 1]
+            writer.add_scalar("rbc/residual_correlation", corr, global_step)
 
     envs.close()
     writer.close()
