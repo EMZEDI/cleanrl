@@ -222,6 +222,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    warmup_steps = int(args.total_timesteps * args.dart_warmup_frac)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     
     if args.track:
@@ -302,11 +303,12 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
+            is_residual_active = args.dart_enabled and (global_step > warmup_steps)
             with torch.no_grad():
                 action, logprob, _, value_hat = agent.get_action_and_value(next_obs)
                 v_base_comp, _ = agent.get_components(next_obs)
-                
-                values_total[step] = value_hat.flatten()
+                active_value_hat = value_hat if is_residual_active else v_base_comp
+                values_total[step] = active_value_hat.flatten()
                 values_base[step] = v_base_comp.flatten()
                 
             actions[step] = action
@@ -328,7 +330,10 @@ if __name__ == "__main__":
         # 1. Standard GAE for Policy and Base Critic (Low Variance, lambda=0.95)
         # Target: y = A_lam + V_total
         with torch.no_grad():
-            next_value_hat = agent.get_value(next_obs).reshape(1, -1)
+            is_residual_active = args.dart_enabled and (global_step > warmup_steps)
+            next_value_hat = (
+                agent.get_value(next_obs) if is_residual_active else agent.get_components(next_obs)[0]
+            ).reshape(1, -1)
             
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
@@ -384,7 +389,7 @@ if __name__ == "__main__":
         clipfracs = []
         
         # Check Freeze Schedule
-        is_residual_active = args.dart_enabled and (global_step > args.total_timesteps * args.dart_warmup_frac)
+        is_residual_active = args.dart_enabled and (global_step > warmup_steps)
 
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
