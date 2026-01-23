@@ -1,4 +1,5 @@
-# solves up to 8X8 mnigrid environment + mountaincar
+# dart_continuous_pendulum_moderate.py
+# DART (Dual Adaptive Residual Tracking) for Moderately-Easier Sparse Pendulum
 import os
 import random
 import time
@@ -9,127 +10,103 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import minigrid
-from minigrid.wrappers import FlatObsWrapper
 import tyro
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 
 @dataclass
 class Args:
-    exp_name: str = "dart"
-    """the name of this experiment"""
+    exp_name: str = "dart_pendulum_sparse"
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "LunarLander-v2"
-    """the id of the environment"""
-    total_timesteps: int = 2000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 4
-    """the number of parallel game environments"""
-    num_steps: int = 128
-    """the number of steps to run in each environment per policy rollout"""
+    env_id: str = "Pendulum-v1"
+    total_timesteps: int = 20000000
+    learning_rate: float = 2e-4
+    num_envs: int = 1
+    num_steps: int = 2048
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation (used for Policy and TD Head)"""
-    num_minibatches: int = 4
-    """the number of mini-batches"""
-    update_epochs: int = 4
-    """the K epochs to update the policy"""
+    num_minibatches: int = 32
+    update_epochs: int = 10
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
+    ent_coef: float = 0.01  # slightly higher exploration
     vf_coef: float = 0.5
-    """coefficient of the value function"""
-    max_grad_norm: float = 0.7
-    """the maximum norm for the gradient clipping"""
+    max_grad_norm: float = 0.5
     target_kl: float = None
-    """the target KL divergence threshold"""
 
-    # DART Specific Arguments
+    # DART Specific Arguments (mild changes)
     dart_enabled: bool = True
-    """whether to use DART (Dual Adaptive Residual Tracking)"""
-    dart_lambda_res: float = 0.999
-    """High lambda for the residual head targets (approximates G_MC for low bias)"""
-    dart_lr_scale: float = 0.1
-    """Learning rate scale for the residual head (Equation 6: beta_res = beta / K)"""
-    dart_warmup_frac: float = 0.2
-    """Fraction of total timesteps to freeze the residual head (Freeze-and-Fine-Tune)"""
+    dart_lambda_res: float = 0.995  # slightly lower than 0.999
+    dart_lr_scale: float = 0.3
+    dart_warmup_frac: float = 0.2  # residual activates earlier (5% of timesteps)
 
-    # to be filled in runtime
+    # Runtime computed
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
 
-class DictFlattenObservation(gym.ObservationWrapper):
-    def __init__(self, env):
-        assert isinstance(env.observation_space, gym.spaces.Dict)
+# --- MODERATE SPARSE REWARD WRAPPER (first-visit one-shot + terminal fallback) ---
+class ModerateSparsePendulumReward(gym.Wrapper):
+    """
+    One-shot first-visit reward wrapper:
+    - Give +1.0 the first time in the episode the agent enters a loose upright region:
+        cos(theta) > first_visit_cos_threshold and |theta_dot| < first_visit_max_abs_vel
+    - Otherwise reward 0 every step. If episode terminates without first-visit success,
+      perform a terminal check using stricter thresholds (terminal_cos_threshold, terminal_max_abs_vel).
+    """
+    def __init__(
+        self,
+        env,
+        first_visit_cos_threshold: float = 0.92,
+        first_visit_max_abs_vel: float = 1.0,
+        terminal_cos_threshold: float = 0.95,
+        terminal_max_abs_vel: float = 0.5,
+    ):
         super().__init__(env)
-        lows = []
-        highs = []
-        self._keys = []
-        self._subspaces = []
-        for key, space in env.observation_space.spaces.items():
-            if isinstance(space, gym.spaces.Box):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(space.low.astype(np.float32).flatten())
-                highs.append(space.high.astype(np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(np.array([0.0], dtype=np.float32))
-                highs.append(np.array([float(space.n - 1)], dtype=np.float32))
-            else:
-                continue
-        if not lows:
-            raise ValueError("DictFlattenObservation needs at least one numeric subspace")
-        self.observation_space = gym.spaces.Box(
-            low=np.concatenate(lows, axis=0),
-            high=np.concatenate(highs, axis=0),
-            dtype=np.float32,
-        )
+        self.first_visit_cos_threshold = first_visit_cos_threshold
+        self.first_visit_max_abs_vel = first_visit_max_abs_vel
+        self.terminal_cos_threshold = terminal_cos_threshold
+        self.terminal_max_abs_vel = terminal_max_abs_vel
+        self._had_success = False
 
-    def observation(self, obs):
-        parts = []
-        for key, space in zip(self._keys, self._subspaces):
-            value = obs[key]
-            if isinstance(space, gym.spaces.Box):
-                parts.append(np.asarray(value, dtype=np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                parts.append(np.asarray(value, dtype=np.float32).reshape(1))
+    def reset(self, **kwargs):
+        # reset the episode-local success flag and propagate reset
+        self._had_success = False
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        sparse_reward = 0.0
+        cos_theta = float(obs[0])
+        theta_dot = float(obs[2])
+
+        # First-visit check (gives a one-shot reward when first satisfied)
+        if (not self._had_success) and (cos_theta > self.first_visit_cos_threshold) and (abs(theta_dot) < self.first_visit_max_abs_vel):
+            sparse_reward = 1.0
+            self._had_success = True
+            return obs, sparse_reward, terminated, truncated, info
+
+        # If episode terminates and we haven't given success earlier, check terminal criteria
+        if (terminated or truncated) and (not self._had_success):
+            if (cos_theta > self.terminal_cos_threshold) and (abs(theta_dot) < self.terminal_max_abs_vel):
+                sparse_reward = 1.0
             else:
-                raise NotImplementedError
-        return np.concatenate(parts, axis=0)
+                sparse_reward = 0.0
+
+        return obs, sparse_reward, terminated, truncated, info
 
 
 def make_env(env_id, idx, capture_video, run_name):
@@ -139,13 +116,22 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        if "MiniGrid" in env_id.lower():
-            env = FlatObsWrapper(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if isinstance(env.observation_space, gym.spaces.Dict):
-            env = DictFlattenObservation(env)
-        return env
 
+        env = gym.wrappers.FlattenObservation(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # Apply the moderate sparse wrapper
+        env = ModerateSparsePendulumReward(
+            env,
+            first_visit_cos_threshold=0.92,
+            first_visit_max_abs_vel=1.0,
+            terminal_cos_threshold=0.95,
+            terminal_max_abs_vel=0.5,
+        )
+
+        env = gym.wrappers.ClipAction(env)
+        # NOTE: still do NOT normalize observations or rewards
+        return env
     return thunk
 
 
@@ -160,17 +146,9 @@ class Agent(nn.Module):
         super().__init__()
         self.dart_enabled = dart_enabled
         obs_shape = np.array(envs.single_observation_space.shape).prod()
-        
-        # Actor Network
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
-        )
+        act_shape = np.prod(envs.single_action_space.shape)
 
-        # Base Critic (Standard, Low Variance) - Corresponds to \theta
+        # Base Critic (V_theta) - Low Variance
         self.critic_base = nn.Sequential(
             layer_init(nn.Linear(obs_shape, 64)),
             nn.Tanh(),
@@ -179,7 +157,7 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64, 1), std=1.0),
         )
 
-        # Residual Critic (Correction, High Variance) - Corresponds to \phi
+        # Residual Critic (V_phi) - Correction
         if self.dart_enabled:
             self.critic_res = nn.Sequential(
                 layer_init(nn.Linear(obs_shape, 64)),
@@ -189,8 +167,18 @@ class Agent(nn.Module):
                 layer_init(nn.Linear(64, 1), std=1.0),
             )
 
+        # Actor (Continuous Mean + LogStd)
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(obs_shape, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, act_shape), std=0.01),
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, act_shape))
+
     def get_value(self, x):
-        """Returns the combined value estimate V_hat = V_theta + V_phi"""
+        """V_hat = V_theta + V_phi"""
         v_base = self.critic_base(x)
         if self.dart_enabled:
             v_res = self.critic_res(x)
@@ -198,7 +186,7 @@ class Agent(nn.Module):
         return v_base
 
     def get_components(self, x):
-        """Returns V_theta (Base) and V_phi (Residual) separately"""
+        """Returns (V_theta, V_phi)"""
         v_base = self.critic_base(x)
         if self.dart_enabled:
             v_res = self.critic_res(x)
@@ -207,15 +195,16 @@ class Agent(nn.Module):
         return v_base, v_res
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
-        probs = Categorical(logits=logits)
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        dist = Normal(action_mean, action_std)
+
         if action is None:
-            action = probs.sample()
-        
-        # Get combined value for advantage calculation
+            action = dist.sample()
+
         value = self.get_value(x)
-        
-        return action, probs.log_prob(action), probs.entropy(), value
+        return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), value
 
 
 if __name__ == "__main__":
@@ -225,7 +214,7 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     warmup_steps = int(args.total_timesteps * args.dart_warmup_frac)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    
+
     if args.track:
         import wandb
         wandb.init(
@@ -243,7 +232,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -253,33 +241,32 @@ if __name__ == "__main__":
 
     # Env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs, dart_enabled=args.dart_enabled).to(device)
-    
-    # Separate optimizers to implement distinct learning rates and updates
-    # Standard parameters (Actor + Base Critic)
-    base_params = list(agent.actor.parameters()) + list(agent.critic_base.parameters())
+
+    # 1. Base Optimizer (Actor + Base Critic)
+    base_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd] + list(agent.critic_base.parameters())
     optimizer_base = optim.Adam(base_params, lr=args.learning_rate, eps=1e-5)
-    
-    # Residual parameters (Slow Learner / Correction)
+
+    # 2. Residual Optimizer (Residual Critic) - Scaled LR
     if args.dart_enabled:
         optimizer_res = optim.Adam(
-            agent.critic_res.parameters(), 
-            lr=args.learning_rate * args.dart_lr_scale, # Smaller stepsize for residual (beta_res = beta/K)
+            agent.critic_res.parameters(),
+            lr=args.learning_rate * args.dart_lr_scale,
             eps=1e-5
         )
 
-    # Storage setup
+    # Storage
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    
-    # Store total value (V_hat) and Base component (V_theta) separately
+
+    # Store V_hat (total) and V_theta (base) separately
     values_total = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values_base = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -290,13 +277,11 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer_base.param_groups[0]["lr"] = lrnow
             if args.dart_enabled:
-                # Maintain the ratio for residual optimizer
                 optimizer_res.param_groups[0]["lr"] = lrnow * args.dart_lr_scale
 
         for step in range(0, args.num_steps):
@@ -308,10 +293,13 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value_hat = agent.get_action_and_value(next_obs)
                 v_base_comp, _ = agent.get_components(next_obs)
+
+                # During warmup, V_total = V_base. After, V_total = V_base + V_res
                 active_value_hat = value_hat if is_residual_active else v_base_comp
+
                 values_total[step] = active_value_hat.flatten()
                 values_base[step] = v_base_comp.flatten()
-                
+
             actions[step] = action
             logprobs[step] = logprob
 
@@ -323,19 +311,18 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-        # ===== DART: Dual GAE Computation =====
-        
-        # 1. Standard GAE for Policy and Base Critic (Low Variance, lambda=0.95)
-        # Target: y = A_lam + V_total
+        # ===== DART: Dual Return Calculation =====
+
+        # 1. Standard GAE (Low Variance, lambda=0.95) -> Target for Base Critic
         with torch.no_grad():
             is_residual_active = args.dart_enabled and (global_step > warmup_steps)
             next_value_hat = (
                 agent.get_value(next_obs) if is_residual_active else agent.get_components(next_obs)[0]
             ).reshape(1, -1)
-            
+
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -347,12 +334,10 @@ if __name__ == "__main__":
                     nextvalues = values_total[t + 1]
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            
-            # Returns for Base critic target (Low Variance)
+
             returns_base = advantages + values_total
 
-        # 2. High-Lambda Return for Residual Head (Low Bias, lambda=0.99 or 1.0)
-        # This approximates G_MC. The residual target will be (returns_res - V_base_frozen)
+        # 2. High-Lambda Return (Low Bias) -> Target for Residual Critic
         if args.dart_enabled:
             with torch.no_grad():
                 returns_res = torch.zeros_like(rewards).to(device)
@@ -364,13 +349,13 @@ if __name__ == "__main__":
                     else:
                         nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values_total[t + 1]
-                    
+
                     delta_res = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
-                    
-                    # DART uses a higher lambda here to reduce bias
+
+                    # High Lambda (but slightly lower than extreme)
                     gae_res = delta_res + args.gamma * args.dart_lambda_res * nextnonterminal * lastgaelam_res
                     lastgaelam_res = gae_res
-                    
+
                     returns_res[t] = gae_res + values_total[t]
 
         # Flatten batch
@@ -379,17 +364,14 @@ if __name__ == "__main__":
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns_base = returns_base.reshape(-1)
-        b_values = values_total.reshape(-1)
-        b_values_base = values_base.reshape(-1) # Frozen Base Snapshot V_theta(k)
-        
+        b_values_base = values_base.reshape(-1)  # The "Frozen" Base snapshot
+
         if args.dart_enabled:
             b_returns_res = returns_res.reshape(-1)
 
         # Optimization
         b_inds = np.arange(args.batch_size)
         clipfracs = []
-        
-        # Check Freeze Schedule
         is_residual_active = args.dart_enabled and (global_step > warmup_steps)
 
         for epoch in range(args.update_epochs):
@@ -398,7 +380,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue_hat = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, _ = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 new_v_base, new_v_res = agent.get_components(b_obs[mb_inds])
 
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -418,11 +400,8 @@ if __name__ == "__main__":
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Base Critic Loss (Low Variance Target)
-                # Matches Equation 5: theta learns to predict Low-Variance Return
+                # Base Critic Loss (Eq 5: Target is Low-Variance Return)
                 newvalue_base = new_v_base.view(-1)
-                
-                # Standard PPO Clipped Value Loss for Base Critic
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue_base - b_returns_base[mb_inds]) ** 2
                     v_clipped = b_values_base[mb_inds] + torch.clamp(
@@ -437,8 +416,6 @@ if __name__ == "__main__":
                     v_loss_base = 0.5 * ((newvalue_base - b_returns_base[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                
-                # Combined Base Loss
                 loss_base = pg_loss - args.ent_coef * entropy_loss + v_loss_base * args.vf_coef
 
                 optimizer_base.zero_grad()
@@ -446,19 +423,14 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(base_params, args.max_grad_norm)
                 optimizer_base.step()
 
-                # Residual Critic Loss (DART Correction)
-                # Matches Equation 6: phi learns (G_MC - V_theta_frozen)
+                # Residual Critic Loss (Eq 6: Target is G_MC - Frozen_Base)
                 if is_residual_active:
                     newvalue_res = new_v_res.view(-1)
-                    
-                    # DART Key: We use b_values_base (the rollout values) as the Frozen Snapshot.
-                    # This ensures the target doesn't drift during the update epochs.
-                    # Target = High_Var_Return - Frozen_Base_Value
+                    # The residual learns to correct the FROZEN base prediction
                     target_res = b_returns_res[mb_inds] - b_values_base[mb_inds]
-                    
-                    # Simple MSE for residual
+
                     loss_res = ((newvalue_res - target_res) ** 2).mean()
-                    
+
                     optimizer_res.zero_grad()
                     loss_res.backward()
                     nn.utils.clip_grad_norm_(agent.critic_res.parameters(), args.max_grad_norm)
@@ -469,32 +441,29 @@ if __name__ == "__main__":
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns_base.cpu().numpy()
+        # Logging
+        y_pred, y_true = (b_values_base + (b_returns_res - b_values_base if args.dart_enabled else 0)).cpu().numpy(), b_returns_base.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # Logging
         writer.add_scalar("charts/learning_rate", optimizer_base.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss_base", v_loss_base.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-        
+
         if args.dart_enabled:
             writer.add_scalar("dart/loss_res", loss_res.item(), global_step)
             writer.add_scalar("dart/is_active", float(is_residual_active), global_step)
-            writer.add_scalar("dart/residual_magnitude", b_values_base.abs().mean().item(), global_step)
-            # Log bias ratio (Residual / Base)
-            mean_res = b_values.mean().item() - b_values_base.mean().item()
-            mean_base = b_values_base.mean().item()
-            writer.add_scalar("dart/bias_fraction", mean_res / (abs(mean_base) + 1e-6), global_step)
-            # Log correlation between Residual and Return Error
-            residual_vals = b_values - b_values_base 
-            td_error = b_returns_base - b_values_base
-            corr = torch.corrcoef(torch.stack((residual_vals, td_error)))[0, 1]
-            writer.add_scalar("dart/residual_correlation", corr, global_step)
+
+            # Log bias analysis
+            with torch.no_grad():
+                mean_res = (b_returns_res - b_values_base).mean().item()
+                writer.add_scalar("dart/residual_correction_mean", mean_res, global_step)
+
+    if args.save_model:
+        torch.save(agent.state_dict(), f"runs/{run_name}/{args.exp_name}.cleanrl_model")
 
     envs.close()
     writer.close()

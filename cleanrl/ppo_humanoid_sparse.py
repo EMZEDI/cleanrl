@@ -1,4 +1,15 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
+# sparse_humanoid.py
+"""
+Sparse checkpoint-based Humanoid locomotion task.
+- Default reward = 0 at every timestep
+- Agent receives +1.0 each time it crosses a forward distance checkpoint (3m, 6m, 9m, etc.)
+  while maintaining healthy posture (z-height in [1.0, 2.0])
+- Episode terminates if unhealthy or after 1000 steps
+- Optional terminal bonus if agent reaches far enough at episode end
+
+This creates a moderately sparse environment where PPO must learn to maintain
+balance AND make forward progress without dense reward signals.
+"""
 import os
 import random
 import time
@@ -9,132 +20,147 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import minigrid
-from minigrid.wrappers import FlatObsWrapper
 import tyro
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
+    exp_name: str = "ppo_humanoid_sparse"
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
-
-    # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
-    """the id of the environment"""
-    total_timesteps: int = 2000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 4
-    """the number of parallel game environments"""
-    num_steps: int = 128
-    """the number of steps to run in each environment per policy rollout"""
+    save_model: bool = False
+    upload_model: bool = False
+    hf_entity: str = ""
+    env_id: str = "Humanoid-v4"
+    total_timesteps: int = 60000000  # Humanoid needs more samples
+    learning_rate: float = 5e-4
+    num_envs: int = 1
+    num_steps: int = 2048
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
-    """the number of mini-batches"""
-    update_epochs: int = 4
-    """the K epochs to update the policy"""
+    num_minibatches: int = 32
+    update_epochs: int = 10
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
+    ent_coef: float = 0.01  # Can increase to 0.001-0.01 for more exploration
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     target_kl: float = None
-    """the target KL divergence threshold"""
-
-    # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
-class DictFlattenObservation(gym.ObservationWrapper):
-    def __init__(self, env):
-        assert isinstance(env.observation_space, gym.spaces.Dict)
+
+# --- SPARSE CHECKPOINT REWARD WRAPPER ---
+class SparseCheckpointHumanoidReward(gym.Wrapper):
+    """
+    Checkpoint-based sparse reward for Humanoid:
+    - +1.0 each time the agent crosses a new distance checkpoint (spacing meters)
+      while maintaining healthy posture (torso z in healthy_z_range).
+    - 0 otherwise.
+    - Optional terminal bonus if far enough at episode end.
+    """
+    def __init__(
+        self,
+        env,
+        checkpoint_spacing: float = 0.5,
+        healthy_z_range: tuple = (1.0, 2.0),
+        terminal_bonus_threshold: float = 10.0,
+        terminal_bonus: float = 5.0,
+    ):
         super().__init__(env)
-        lows = []
-        highs = []
-        self._keys = []
-        self._subspaces = []
-        for key, space in env.observation_space.spaces.items():
-            if isinstance(space, gym.spaces.Box):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(space.low.astype(np.float32).flatten())
-                highs.append(space.high.astype(np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(np.array([0.0], dtype=np.float32))
-                highs.append(np.array([float(space.n - 1)], dtype=np.float32))
-            else:
-                continue
-        if not lows:
-            raise ValueError("DictFlattenObservation needs at least one numeric subspace")
-        self.observation_space = gym.spaces.Box(
-            low=np.concatenate(lows, axis=0),
-            high=np.concatenate(highs, axis=0),
-            dtype=np.float32,
-        )
+        self.checkpoint_spacing = checkpoint_spacing
+        self.healthy_z_range = healthy_z_range
+        self.terminal_bonus_threshold = terminal_bonus_threshold
+        self.terminal_bonus = terminal_bonus
 
-    def observation(self, obs):
-        parts = []
-        for key, space in zip(self._keys, self._subspaces):
-            value = obs[key]
-            if isinstance(space, gym.spaces.Box):
-                parts.append(np.asarray(value, dtype=np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                parts.append(np.asarray(value, dtype=np.float32).reshape(1))
-            else:
-                raise NotImplementedError
-        return np.concatenate(parts, axis=0)
+        self._highest_checkpoint = 0
+        self._initial_x = 0.0
 
-def make_env(env_id, idx, capture_video, run_name):
+    def _get_torso_height(self, obs):
+        # Prefer true MuJoCo qpos height when available (robust to any obs normalization)
+        try:
+            return float(self.env.unwrapped.data.qpos[2])
+        except Exception:
+            # Fallback: in Humanoid default observation, obs[0] is torso z-coordinate
+            return float(obs[0])
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._highest_checkpoint = 0
+        # Humanoid returns x_position in info regardless of exclude_current_positions_from_observation
+        self._initial_x = float(info.get("x_position", 0.0))
+        return obs, info
+
+    def step(self, action):
+        obs, _, terminated, truncated, info = self.env.step(action)
+
+        sparse_reward = 0.0
+
+        x_pos = float(info.get("x_position", 0.0))
+        forward_distance = x_pos - self._initial_x
+
+        z_height = self._get_torso_height(obs)
+        is_healthy = (self.healthy_z_range[0] <= z_height <= self.healthy_z_range[1])
+
+        if is_healthy and forward_distance > 0:
+            current_checkpoint = int(forward_distance / self.checkpoint_spacing)
+            if current_checkpoint > self._highest_checkpoint:
+                sparse_reward = float(current_checkpoint - self._highest_checkpoint)
+                self._highest_checkpoint = current_checkpoint
+
+        if (terminated or truncated) and (forward_distance >= self.terminal_bonus_threshold):
+            sparse_reward += self.terminal_bonus
+
+        info["checkpoints_reached"] = self._highest_checkpoint
+        info["forward_distance"] = forward_distance
+
+        if is_healthy:
+            sparse_reward += 0.05
+        return obs, sparse_reward, terminated, truncated, info
+
+
+def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        if "MiniGrid" in env_id.lower():
-            env = FlatObsWrapper(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if isinstance(env.observation_space, gym.spaces.Dict):
-            env = DictFlattenObservation(env)
-        return env
 
+        # 1) Apply sparse reward FIRST (before any obs normalization / clipping)
+        env = SparseCheckpointHumanoidReward(
+            env,
+            checkpoint_spacing=2.0,
+            healthy_z_range=(1.0, 2.0),
+            terminal_bonus_threshold=10.0,
+            terminal_bonus=5.0,
+        )
+
+        # 2) Then standard wrappers
+        env = gym.wrappers.FlattenObservation(env)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+
+        # Record stats after reward shaping so episodic_return is sparse-return
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # Optional: keep this, but see note below about clip/logprob mismatch
+        env = gym.wrappers.ClipAction(env)
+
+        return env
     return thunk
+
+
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -146,30 +172,37 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
+        obs_shape = np.array(envs.single_observation_space.shape).prod()
+        act_shape = np.prod(envs.single_action_space.shape)
+        
+        # Larger networks for Humanoid's high-dimensional space
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(obs_shape, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(obs_shape, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(256, act_shape), std=0.01),
         )
+        self.actor_logstd = nn.Parameter(torch.ones(1, act_shape) * -1.0)  # std ~ 0.37
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
-        probs = Categorical(logits=logits)
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        dist = Normal(action_mean, action_std)
         if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+            action = dist.sample()
+        return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), self.critic(x)
 
 
 if __name__ == "__main__":
@@ -178,9 +211,9 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -196,7 +229,7 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
+    # seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -206,14 +239,14 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup
+    # Storage
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -221,7 +254,6 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
@@ -229,7 +261,6 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
@@ -240,27 +271,31 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
+            # step the environment
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-
-        # bootstrap value if not done
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if info and "episode" in info:
+                    print(
+                        f"global_step={global_step}, episodic_return={info['episode']['r'].item():.2f}, "
+                        f"checkpoints={info.get('checkpoints_reached', 0)}, "
+                        f"distance={info.get('forward_distance', 0):.2f}m"
+                    )
+                    writer.add_scalar("charts/episodic_return", info["episode"]["r"].item(), global_step)
+                    writer.add_scalar("charts/episodic_length", info["episode"]["l"].item(), global_step)
+                    writer.add_scalar("charts/checkpoints_reached", info.get("checkpoints_reached", 0), global_step)
+                    writer.add_scalar("charts/forward_distance", info.get("forward_distance", 0), global_step)
+        # bootstrap GAE
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -276,7 +311,7 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # flatten the batch
+        # flatten
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -284,7 +319,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
+        # update loop
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -293,12 +328,11 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -307,12 +341,10 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -338,11 +370,11 @@ if __name__ == "__main__":
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
+        # logging
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
@@ -353,6 +385,11 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        torch.save(agent.state_dict(), model_path)
+        print(f"model saved to {model_path}")
 
     envs.close()
     writer.close()

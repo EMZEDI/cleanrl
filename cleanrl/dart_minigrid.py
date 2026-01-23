@@ -1,4 +1,3 @@
-# solves up to 8X8 mnigrid environment + mountaincar
 import os
 import random
 import time
@@ -18,118 +17,44 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    exp_name: str = "dart"
-    """the name of this experiment"""
+    exp_name: str = "dart_ppo_lstm_flat"
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
 
-    # Algorithm specific arguments
-    env_id: str = "LunarLander-v2"
-    """the id of the environment"""
-    total_timesteps: int = 2000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 4
-    """the number of parallel game environments"""
-    num_steps: int = 128
-    """the number of steps to run in each environment per policy rollout"""
+    # Harder Environment
+    env_id: str = "MiniGrid-MultiRoom-N4-S5-v0"
+    total_timesteps: int = 5_000_000
+    learning_rate: float = 3e-4
+    num_envs: int = 16 
+    num_steps: int = 1024
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation (used for Policy and TD Head)"""
     num_minibatches: int = 4
-    """the number of mini-batches"""
     update_epochs: int = 4
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
+    ent_coef: float = 0.01 
     vf_coef: float = 0.5
-    """coefficient of the value function"""
-    max_grad_norm: float = 0.7
-    """the maximum norm for the gradient clipping"""
+    max_grad_norm: float = 0.5
     target_kl: float = None
-    """the target KL divergence threshold"""
 
-    # DART Specific Arguments
+    # DART Specific
     dart_enabled: bool = True
-    """whether to use DART (Dual Adaptive Residual Tracking)"""
-    dart_lambda_res: float = 0.999
-    """High lambda for the residual head targets (approximates G_MC for low bias)"""
+    dart_lambda_res: float = 0.998
     dart_lr_scale: float = 0.1
-    """Learning rate scale for the residual head (Equation 6: beta_res = beta / K)"""
-    dart_warmup_frac: float = 0.2
-    """Fraction of total timesteps to freeze the residual head (Freeze-and-Fine-Tune)"""
+    dart_warmup_frac: float = 0.1
 
-    # to be filled in runtime
+    # Runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
-
-
-class DictFlattenObservation(gym.ObservationWrapper):
-    def __init__(self, env):
-        assert isinstance(env.observation_space, gym.spaces.Dict)
-        super().__init__(env)
-        lows = []
-        highs = []
-        self._keys = []
-        self._subspaces = []
-        for key, space in env.observation_space.spaces.items():
-            if isinstance(space, gym.spaces.Box):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(space.low.astype(np.float32).flatten())
-                highs.append(space.high.astype(np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                self._keys.append(key)
-                self._subspaces.append(space)
-                lows.append(np.array([0.0], dtype=np.float32))
-                highs.append(np.array([float(space.n - 1)], dtype=np.float32))
-            else:
-                continue
-        if not lows:
-            raise ValueError("DictFlattenObservation needs at least one numeric subspace")
-        self.observation_space = gym.spaces.Box(
-            low=np.concatenate(lows, axis=0),
-            high=np.concatenate(highs, axis=0),
-            dtype=np.float32,
-        )
-
-    def observation(self, obs):
-        parts = []
-        for key, space in zip(self._keys, self._subspaces):
-            value = obs[key]
-            if isinstance(space, gym.spaces.Box):
-                parts.append(np.asarray(value, dtype=np.float32).flatten())
-            elif isinstance(space, gym.spaces.Discrete):
-                parts.append(np.asarray(value, dtype=np.float32).reshape(1))
-            else:
-                raise NotImplementedError
-        return np.concatenate(parts, axis=0)
 
 
 def make_env(env_id, idx, capture_video, run_name):
@@ -139,13 +64,11 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        if "MiniGrid" in env_id.lower():
-            env = FlatObsWrapper(env)
+        
+        # KEY: Using FlatObsWrapper as requested
+        env = FlatObsWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if isinstance(env.observation_space, gym.spaces.Dict):
-            env = DictFlattenObservation(env)
         return env
-
     return thunk
 
 
@@ -161,61 +84,106 @@ class Agent(nn.Module):
         self.dart_enabled = dart_enabled
         obs_shape = np.array(envs.single_observation_space.shape).prod()
         
-        # Actor Network
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 64)),
+        # 1. Feature Extractor
+        self.encoder = nn.Sequential(
+            layer_init(nn.Linear(obs_shape, 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(128, 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
         )
 
-        # Base Critic (Standard, Low Variance) - Corresponds to \theta
-        self.critic_base = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
+        # 2. LSTM
+        self.lstm = nn.LSTM(128, 128)
+        for name, param in self.lstm.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
 
-        # Residual Critic (Correction, High Variance) - Corresponds to \phi
+        # 3. Heads
+        self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
+        self.critic_base = layer_init(nn.Linear(128, 1), std=1.0)
         if self.dart_enabled:
-            self.critic_res = nn.Sequential(
-                layer_init(nn.Linear(obs_shape, 64)),
-                nn.Tanh(),
-                layer_init(nn.Linear(64, 64)),
-                nn.Tanh(),
-                layer_init(nn.Linear(64, 1), std=1.0),
-            )
+            self.critic_res = layer_init(nn.Linear(128, 1), std=1.0)
 
-    def get_value(self, x):
-        """Returns the combined value estimate V_hat = V_theta + V_phi"""
-        v_base = self.critic_base(x)
+    def get_states(self, x, lstm_state, done):
+        # x: (Total_Steps, Obs_Dim)
+        hidden = self.encoder(x)
+
+        # Infer dimensions
+        # lstm_state is (1, batch_size, hidden)
+        batch_size = lstm_state[0].shape[1]
+        seq_len = x.shape[0] // batch_size
+
+        if seq_len == 1:
+            # Inference / Rollout mode (Fast)
+            # Reshape to (Seq=1, Batch, Feat)
+            hidden = hidden.view(1, batch_size, -1)
+            
+            # Reset state based on done
+            h, c = lstm_state
+            mask = (1.0 - done).view(1, -1, 1)
+            h = h * mask
+            c = c * mask
+            
+            # Forward
+            new_hidden, (new_h, new_c) = self.lstm(hidden, (h, c))
+            return new_hidden.flatten(0, 1), (new_h, new_c)
+        
+        else:
+            # Training mode (Sequence Learning)
+            # Reshape to (Seq, Batch, Feat)
+            hidden = hidden.view(seq_len, batch_size, -1)
+            done = done.view(seq_len, batch_size)
+            
+            h, c = lstm_state
+            outputs = []
+            
+            # Manually loop to handle resets inside the batch
+            for t in range(seq_len):
+                mask = (1.0 - done[t]).view(1, -1, 1)
+                h = h * mask
+                c = c * mask
+                
+                step_out, (h, c) = self.lstm(hidden[t].unsqueeze(0), (h, c))
+                outputs.append(step_out.squeeze(0))
+                
+            new_hidden = torch.stack(outputs, dim=0) # (Seq, Batch, Feat)
+            return new_hidden.flatten(0, 1), (h, c)
+
+    # Rest of the methods remain similar...
+    def get_value(self, x, lstm_state, done):
+        hidden, _ = self.get_states(x, lstm_state, done)
+        v_base = self.critic_base(hidden)
         if self.dart_enabled:
-            v_res = self.critic_res(x)
+            v_res = self.critic_res(hidden.detach())
             return v_base + v_res
         return v_base
 
-    def get_components(self, x):
-        """Returns V_theta (Base) and V_phi (Residual) separately"""
-        v_base = self.critic_base(x)
+    def get_components(self, x, lstm_state, done):
+        hidden, _ = self.get_states(x, lstm_state, done)
+        v_base = self.critic_base(hidden)
         if self.dart_enabled:
-            v_res = self.critic_res(x)
+            v_res = self.critic_res(hidden.detach())
         else:
             v_res = torch.zeros_like(v_base)
         return v_base, v_res
 
-    def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+    def get_action_and_value(self, x, lstm_state, done, action=None):
+        hidden, next_lstm_state = self.get_states(x, lstm_state, done)
+        logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         
-        # Get combined value for advantage calculation
-        value = self.get_value(x)
-        
-        return action, probs.log_prob(action), probs.entropy(), value
+        v_base = self.critic_base(hidden)
+        if self.dart_enabled:
+            v_res = self.critic_res(hidden.detach())
+            value = v_base + v_res
+        else:
+            value = v_base
+            
+        return action, probs.log_prob(action), probs.entropy(), value, next_lstm_state
 
 
 if __name__ == "__main__":
@@ -243,7 +211,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -255,49 +222,65 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs, dart_enabled=args.dart_enabled).to(device)
     
-    # Separate optimizers to implement distinct learning rates and updates
-    # Standard parameters (Actor + Base Critic)
-    base_params = list(agent.actor.parameters()) + list(agent.critic_base.parameters())
+    # Optimizer
+    # Includes Encoder + LSTM + Actor + Base Critic
+    base_params = (
+        list(agent.encoder.parameters()) + 
+        list(agent.lstm.parameters()) + 
+        list(agent.actor.parameters()) + 
+        list(agent.critic_base.parameters())
+    )
     optimizer_base = optim.Adam(base_params, lr=args.learning_rate, eps=1e-5)
     
-    # Residual parameters (Slow Learner / Correction)
     if args.dart_enabled:
         optimizer_res = optim.Adam(
             agent.critic_res.parameters(), 
-            lr=args.learning_rate * args.dart_lr_scale, # Smaller stepsize for residual (beta_res = beta/K)
+            lr=args.learning_rate * args.dart_lr_scale, 
             eps=1e-5
         )
 
-    # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    # Storage
+    # obs_shape is flattened (e.g. 147)
+    obs_dim = np.array(envs.single_observation_space.shape).prod()
+    obs = torch.zeros((args.num_steps, args.num_envs, obs_dim)).to(device)
+    
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     
-    # Store total value (V_hat) and Base component (V_theta) separately
     values_total = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values_base = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
+    # Global Step
     global_step = 0
     start_time = time.time()
+    
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    
+    # LSTM States (h, c) - initialized to zeros
+    # Shape: (1, num_envs, hidden_dim)
+    next_lstm_state = (
+        torch.zeros(1, args.num_envs, 128).to(device),
+        torch.zeros(1, args.num_envs, 128).to(device),
+    )
 
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing
+        # LR Annealing
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer_base.param_groups[0]["lr"] = lrnow
             if args.dart_enabled:
-                # Maintain the ratio for residual optimizer
                 optimizer_res.param_groups[0]["lr"] = lrnow * args.dart_lr_scale
+
+        # Store initial LSTM state for the rollout
+        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -305,9 +288,14 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             is_residual_active = args.dart_enabled and (global_step > warmup_steps)
+            
             with torch.no_grad():
-                action, logprob, _, value_hat = agent.get_action_and_value(next_obs)
-                v_base_comp, _ = agent.get_components(next_obs)
+                action, logprob, _, value_hat, next_lstm_state = agent.get_action_and_value(
+                    next_obs, next_lstm_state, next_done
+                )
+                
+                # Separate components logic
+                v_base_comp, _ = agent.get_components(next_obs, next_lstm_state, next_done)
                 active_value_hat = value_hat if is_residual_active else v_base_comp
                 values_total[step] = active_value_hat.flatten()
                 values_base[step] = v_base_comp.flatten()
@@ -315,10 +303,10 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            real_next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            next_obs, next_done = torch.Tensor(real_next_obs).to(device), torch.Tensor(next_done).to(device)
 
             if "final_info" in infos:
                 for info in infos["final_info"]:
@@ -326,16 +314,15 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-        # ===== DART: Dual GAE Computation =====
-        
-        # 1. Standard GAE for Policy and Base Critic (Low Variance, lambda=0.95)
-        # Target: y = A_lam + V_total
+        # GAE Calculation
         with torch.no_grad():
             is_residual_active = args.dart_enabled and (global_step > warmup_steps)
-            next_value_hat = (
-                agent.get_value(next_obs) if is_residual_active else agent.get_components(next_obs)[0]
-            ).reshape(1, -1)
             
+            # Get next value for GAE
+            next_value_hat = agent.get_value(next_obs, next_lstm_state, next_done).reshape(1, -1)
+            if not is_residual_active:
+                 next_value_hat = agent.get_components(next_obs, next_lstm_state, next_done)[0].reshape(1, -1)
+
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -348,13 +335,10 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             
-            # Returns for Base critic target (Low Variance)
             returns_base = advantages + values_total
 
-        # 2. High-Lambda Return for Residual Head (Low Bias, lambda=0.99 or 1.0)
-        # This approximates G_MC. The residual target will be (returns_res - V_base_frozen)
-        if args.dart_enabled:
-            with torch.no_grad():
+            # DART High Lambda Return
+            if args.dart_enabled:
                 returns_res = torch.zeros_like(rewards).to(device)
                 lastgaelam_res = 0
                 for t in reversed(range(args.num_steps)):
@@ -364,42 +348,60 @@ if __name__ == "__main__":
                     else:
                         nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values_total[t + 1]
-                    
                     delta_res = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
-                    
-                    # DART uses a higher lambda here to reduce bias
                     gae_res = delta_res + args.gamma * args.dart_lambda_res * nextnonterminal * lastgaelam_res
                     lastgaelam_res = gae_res
-                    
                     returns_res[t] = gae_res + values_total[t]
 
         # Flatten batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs.reshape((-1, obs_dim))
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns_base = returns_base.reshape(-1)
         b_values = values_total.reshape(-1)
-        b_values_base = values_base.reshape(-1) # Frozen Base Snapshot V_theta(k)
+        b_values_base = values_base.reshape(-1)
         
         if args.dart_enabled:
             b_returns_res = returns_res.reshape(-1)
 
         # Optimization
-        b_inds = np.arange(args.batch_size)
-        clipfracs = []
+        envs_per_batch = args.num_envs // args.num_minibatches
+        env_inds = np.arange(args.num_envs) 
+        flat_inds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         
-        # Check Freeze Schedule
+        clipfracs = []
         is_residual_active = args.dart_enabled and (global_step > warmup_steps)
 
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue_hat = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                new_v_base, new_v_res = agent.get_components(b_obs[mb_inds])
+            np.random.shuffle(env_inds)
+            for start in range(0, args.num_envs, envs_per_batch):
+                end = start + envs_per_batch
+                mb_env_inds = env_inds[start:end]
+                
+                # Get indices for this minibatch
+                mb_inds = flat_inds[:, mb_env_inds].flatten()
+                
+                # Prepare LSTM states for the start of the batch (step 0)
+                # Correctly slicing the tuple of tensors (1, num_envs, hidden)
+                h_0 = initial_lstm_state[0][:, mb_env_inds, :]
+                c_0 = initial_lstm_state[1][:, mb_env_inds, :]
+                
+                # Forward pass
+                _, newlogprob, entropy, newvalue_hat, _ = agent.get_action_and_value(
+                    b_obs[mb_inds], 
+                    (h_0, c_0), 
+                    b_dones[mb_inds], 
+                    b_actions.long()[mb_inds]
+                )
+                
+                # Components pass
+                new_v_base, new_v_res = agent.get_components(
+                    b_obs[mb_inds], 
+                    (h_0, c_0), 
+                    b_dones[mb_inds]
+                )
 
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -418,11 +420,8 @@ if __name__ == "__main__":
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Base Critic Loss (Low Variance Target)
-                # Matches Equation 5: theta learns to predict Low-Variance Return
+                # Base Critic Loss
                 newvalue_base = new_v_base.view(-1)
-                
-                # Standard PPO Clipped Value Loss for Base Critic
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue_base - b_returns_base[mb_inds]) ** 2
                     v_clipped = b_values_base[mb_inds] + torch.clamp(
@@ -437,8 +436,6 @@ if __name__ == "__main__":
                     v_loss_base = 0.5 * ((newvalue_base - b_returns_base[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                
-                # Combined Base Loss
                 loss_base = pg_loss - args.ent_coef * entropy_loss + v_loss_base * args.vf_coef
 
                 optimizer_base.zero_grad()
@@ -446,17 +443,10 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(base_params, args.max_grad_norm)
                 optimizer_base.step()
 
-                # Residual Critic Loss (DART Correction)
-                # Matches Equation 6: phi learns (G_MC - V_theta_frozen)
+                # Residual Critic Loss (DART)
                 if is_residual_active:
                     newvalue_res = new_v_res.view(-1)
-                    
-                    # DART Key: We use b_values_base (the rollout values) as the Frozen Snapshot.
-                    # This ensures the target doesn't drift during the update epochs.
-                    # Target = High_Var_Return - Frozen_Base_Value
                     target_res = b_returns_res[mb_inds] - b_values_base[mb_inds]
-                    
-                    # Simple MSE for residual
                     loss_res = ((newvalue_res - target_res) ** 2).mean()
                     
                     optimizer_res.zero_grad()
@@ -473,28 +463,15 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # Logging
         writer.add_scalar("charts/learning_rate", optimizer_base.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss_base", v_loss_base.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         
         if args.dart_enabled:
             writer.add_scalar("dart/loss_res", loss_res.item(), global_step)
-            writer.add_scalar("dart/is_active", float(is_residual_active), global_step)
-            writer.add_scalar("dart/residual_magnitude", b_values_base.abs().mean().item(), global_step)
-            # Log bias ratio (Residual / Base)
-            mean_res = b_values.mean().item() - b_values_base.mean().item()
-            mean_base = b_values_base.mean().item()
-            writer.add_scalar("dart/bias_fraction", mean_res / (abs(mean_base) + 1e-6), global_step)
-            # Log correlation between Residual and Return Error
-            residual_vals = b_values - b_values_base 
-            td_error = b_returns_base - b_values_base
-            corr = torch.corrcoef(torch.stack((residual_vals, td_error)))[0, 1]
-            writer.add_scalar("dart/residual_correlation", corr, global_step)
 
     envs.close()
     writer.close()
