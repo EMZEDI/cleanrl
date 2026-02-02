@@ -25,6 +25,9 @@ dependencies = [
     "tyro>=0.5.10",
     "minigrid>=3.0.0",
     "mujoco>=2.3.3",
+    "optuna>=3.3.0",
+    "matplotlib>=3.5.3",
+    "pandas>=1.3.5",
 ]
 
 [project.optional-dependencies]
