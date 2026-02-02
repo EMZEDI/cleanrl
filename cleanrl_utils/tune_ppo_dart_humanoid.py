@@ -88,7 +88,6 @@ def run_trial(
         "num-envs": 64,
         "num-steps": 1024,
         "seed": seed,
-        "cuda": True,
         "no-track": "",
         "capture-video": "",
     }
