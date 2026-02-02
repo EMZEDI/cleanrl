@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=tune_humanoid
-#SBATCH --nodes=80
+#SBATCH --nodes=60
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --account=aip-rrabba
 #SBATCH --mem=0
 #SBATCH --time=02:59:00
-#SBATCH --output=/scratch/shahradm/slurm_logs/tune_humanoid_%A_%a.out
-#SBATCH --error=/scratch/shahradm/slurm_logs/tune_humanoid_%A_%a.err
+#SBATCH --output=/scratch/shahradm/slurm_logs/tune_humanoid_%j.out
+#SBATCH --error=/scratch/shahradm/slurm_logs/tune_humanoid_%j.err
 
 # ================================================================================
 # Massive-scale hyperparameter tuning for PPO vs DART on Humanoid-v4
@@ -65,8 +65,8 @@ source .env
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
-# Run tuning script (launches multiple workers per GPU)
-python cleanrl_utils/tune_ppo_dart_humanoid.py \
+# Run tuning script on all nodes (launches multiple workers per GPU)
+srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 python cleanrl_utils/tune_ppo_dart_humanoid.py \
     --algorithm $ALGORITHM \
     --study-name $STUDY_NAME \
     --storage $STORAGE \
