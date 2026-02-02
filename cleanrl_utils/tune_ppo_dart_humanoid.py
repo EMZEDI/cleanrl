@@ -87,10 +87,6 @@ def run_trial(
         "total-timesteps": total_timesteps,
         "num-envs": 64,
         "num-steps": 1024,
-        "vectorization": "async",
-        "torch-compile": True,
-        "compile-mode": "reduce-overhead",
-        "enable-tf32": True,
         "track": False,  # No wandb on compute nodes
         "capture-video": False,
         "save-model": False,
