@@ -1,12 +1,9 @@
-# moderate_sparse_pendulum.py
+# dense_humanoid.py
 """
-Moderately easier sparse Pendulum swing-up (first-visit one-shot reward).
-- Reward = 0 every timestep by default.
-- If the agent *first time in the episode* enters a loose upright region
-  (cos(theta) > 0.92 and |theta_dot| < 1.0) it receives +1.0 (one-shot).
-- If the episode terminates without first-visit success, we still give a
-  terminal check using stricter thresholds (cos > 0.95 and |vel| < 0.5).
-This keeps the problem sparse but less brutally strict than the hard version.
+Standard Dense Humanoid-v4 PPO.
+- Reverted to original 'Humanoid-v4' dense reward signal:
+  (forward_velocity + healthy_bonus - control_cost - contact_cost)
+- Added Reward Normalization (critical for PPO stability with dense rewards)
 """
 import os
 import random
@@ -25,22 +22,21 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    exp_name: str = "ppo_pendulum_sparse"
+    exp_name: str = "ppo_humanoid_dense"  # Updated name
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
     wandb_project_name: str = "cleanRL"
-    wandb_run_name: str = "ppo_pendulum_sparse"
+    wandb_run_name: str = "ppo_humanoid_dense_v1"
     wandb_entity: str = None
     capture_video: bool = False
     save_model: bool = False
     upload_model: bool = False
     hf_entity: str = ""
-    env_id: str = "Pendulum-v1"
-    # I left your very large total_timesteps as-is, but you can reduce this for quick tests.
-    total_timesteps: int = 60000000
-    learning_rate: float = 1e-4
+    env_id: str = "Humanoid-v4"
+    total_timesteps: int = 70000000 
+    learning_rate: float = 5e-4 # Standard Humanoid LR
     num_envs: int = 1
     num_steps: int = 2048
     anneal_lr: bool = True
@@ -51,71 +47,13 @@ class Args:
     norm_adv: bool = True
     clip_coef: float = 0.2
     clip_vloss: bool = True
-    ent_coef: float = 0.01  # slightly encourage exploration
+    ent_coef: float = 0.01 
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float = None
     batch_size: int = 0
     minibatch_size: int = 0
     num_iterations: int = 0
-
-
-# --- MODERATELY-SPARSE REWARD WRAPPER ---
-class ModerateSparsePendulumReward(gym.Wrapper):
-    """
-    One-shot first-visit reward wrapper:
-    - Give +1.0 the first time in the episode the agent enters a loose upright region:
-        cos(theta) > first_visit_cos_threshold and |theta_dot| < first_visit_max_abs_vel
-    - Otherwise reward 0 every step. If episode terminates without first-visit success,
-      perform a terminal check using stricter thresholds (terminal_cos_threshold, terminal_max_abs_vel).
-    """
-    def __init__(
-        self,
-        env,
-        first_visit_cos_threshold: float = 0.92,
-        first_visit_max_abs_vel: float = 1.0,
-        terminal_cos_threshold: float = 0.95,
-        terminal_max_abs_vel: float = 0.5,
-    ):
-        super().__init__(env)
-        self.first_visit_cos_threshold = first_visit_cos_threshold
-        self.first_visit_max_abs_vel = first_visit_max_abs_vel
-        self.terminal_cos_threshold = terminal_cos_threshold
-        self.terminal_max_abs_vel = terminal_max_abs_vel
-        # episode-local flag; reset on env.reset()
-        self._had_success = False
-
-    def reset(self, **kwargs):
-        # gymnasium returns (obs, info)
-        obs_reset = self.env.reset(**kwargs)
-        self._had_success = False
-        return obs_reset
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        # Default: zero reward
-        sparse_reward = 0.0
-
-        # obs layout for Pendulum-v1: [cos(theta), sin(theta), theta_dot]
-        cos_theta = float(obs[0])
-        theta_dot = float(obs[2])
-
-        # First-visit check (gives a one-shot reward when first satisfied)
-        if (not self._had_success) and (cos_theta > self.first_visit_cos_threshold) and (abs(theta_dot) < self.first_visit_max_abs_vel):
-            sparse_reward = 1.0
-            self._had_success = True
-            # return immediately (this episode still continues, but we've given the one-shot)
-            return obs, sparse_reward, terminated, truncated, info
-
-        # If episode terminates and we haven't given a success earlier, check terminal criteria
-        if (terminated or truncated) and (not self._had_success):
-            if (cos_theta > self.terminal_cos_threshold) and (abs(theta_dot) < self.terminal_max_abs_vel):
-                sparse_reward = 1.0
-            else:
-                sparse_reward = 0.0
-
-        return obs, sparse_reward, terminated, truncated, info
 
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
@@ -126,26 +64,26 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         else:
             env = gym.make(env_id)
 
-        env = gym.wrappers.FlattenObservation(env)
+        # --- STANDARD DENSE REWARD STACK ---
+        
+        # 1. Record raw stats (before normalization) so we see the true Humanoid score
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        # Apply the moderately-sparse wrapper (easier than terminal-only)
-        env = ModerateSparsePendulumReward(
-            env,
-            first_visit_cos_threshold=0.92,
-            first_visit_max_abs_vel=1.0,
-            terminal_cos_threshold=0.95,
-            terminal_max_abs_vel=0.5,
-        )
-
+        # 2. Clip actions (standard for continuous control)
         env = gym.wrappers.ClipAction(env)
-        # Do NOT apply NormalizeObservation/NormalizeReward here to keep sparseness intact
-        return env
 
+        # 3. Normalize Observations (Crucial for Humanoid)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+
+        # 4. Normalize Rewards (Crucial for dense Humanoid to stabilize Value function)
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+
+        return env
     return thunk
 
 
-# (rest of the script is identical to your original training loop and agent setup)
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -157,21 +95,22 @@ class Agent(nn.Module):
         super().__init__()
         obs_shape = np.array(envs.single_observation_space.shape).prod()
         act_shape = np.prod(envs.single_action_space.shape)
+        
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 64)),
+            layer_init(nn.Linear(obs_shape, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(obs_shape, 64)),
+            layer_init(nn.Linear(obs_shape, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, act_shape), std=0.01),
+            layer_init(nn.Linear(256, act_shape), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, act_shape))
+        self.actor_logstd = nn.Parameter(torch.ones(1, act_shape) * -0.5)
 
     def get_value(self, x):
         return self.critic(x)
@@ -264,12 +203,13 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if info and "episode" in info:
+                    # Removed sparse-specific logging (checkpoints/dist) as they are not standard info keys
+                    print(f"global_step={global_step}, episodic_return={info['episode']['r'].item():.2f}")
+                    writer.add_scalar("charts/episodic_return", info["episode"]["r"].item(), global_step)
+                    writer.add_scalar("charts/episodic_length", info["episode"]["l"].item(), global_step)
 
         # bootstrap GAE
         with torch.no_grad():
@@ -295,7 +235,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # update loop (same as before)
+        # update loop
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -346,7 +286,7 @@ if __name__ == "__main__":
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
-        # logging and wrap-up
+        # logging
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
@@ -363,7 +303,7 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     if args.save_model:
-        model_path = f"/scratch/s/shahradm/cleanrl/{run_name}/{args.exp_name}.cleanrl_model"
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
 

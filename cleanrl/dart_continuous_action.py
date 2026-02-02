@@ -17,19 +17,19 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    exp_name: str = "dart_pendulum_sparse"
+    exp_name: str = "dart_continuous_action"
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
     wandb_project_name: str = "cleanRL"
-    wandb_run_name: str = "dart_pendulum_sparse"
+    wandb_run_name: str = "dart_continuous_action_cartpole_swingup_sparsev0"
     wandb_entity: str = None
     capture_video: bool = False
 
     # Algorithm specific arguments
-    env_id: str = "Pendulum-v1"
-    total_timesteps: int = 60000000
+    env_id: str = "dm_control/cartpole-swingup_sparse-v0"
+    total_timesteps: int = 2000000
     learning_rate: float = 2e-4
     num_envs: int = 1
     num_steps: int = 2048

@@ -22,6 +22,7 @@ class Args:
     cuda: bool = True
     track: bool = False
     wandb_project_name: str = "cleanRL"
+    wandb_run_name: str = "dart_humanoid_sparse"
     wandb_entity: str = None
     capture_video: bool = False
 
@@ -30,7 +31,7 @@ class Args:
 
     # Algorithm specific arguments (UNCHANGED from your pendulum DART script)
     env_id: str = "Humanoid-v4"
-    total_timesteps: int = 60000000
+    total_timesteps: int = 120000000
     learning_rate: float = 5e-4
     num_envs: int = 1
     num_steps: int = 2048
@@ -488,7 +489,7 @@ if __name__ == "__main__":
                     )
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        model_path = f"/scratch/s/shahradm/cleanrl/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
 

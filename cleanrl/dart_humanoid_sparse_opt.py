@@ -16,20 +16,20 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    exp_name: str = "ppo_humanoid_sparse_opt"
+    exp_name: str = "dart_humanoid_sparse_opt"
     seed: int = 1
-    torch_deterministic: bool = False
+    torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
     wandb_project_name: str = "cleanRL"
-    wandb_run_name: str = "ppo_humanoid_sparse_opt"
+    wandb_run_name: str = "dart_humanoid_sparse_opt"
     wandb_entity: str = None
     capture_video: bool = False
     save_model: bool = False
 
+    # Env / algorithm
     env_id: str = "Humanoid-v4"
     total_timesteps: int = 150_000_000
-
     learning_rate: float = 5e-4
     num_envs: int = 32
     num_steps: int = 1024
@@ -46,16 +46,20 @@ class Args:
     max_grad_norm: float = 0.5
     target_kl: float = None
 
+    # DART
+    dart_enabled: bool = True
+    dart_lambda_res: float = 0.9999
+    dart_lr_scale: float = 0.17
+    dart_warmup_frac: float = 0.4
+
     # Speed knobs
     vectorization: str = "async"  # "sync" or "async"
     async_shared_memory: bool = False
     async_context: Optional[str] = None  # e.g., "forkserver" sometimes helps on clusters
-
     torch_compile: bool = False
     compile_mode: str = "reduce-overhead"  # "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"
-
-    set_float32_matmul_precision: str = "high"  # "high" or "highest" if supported
-    enable_tf32: bool = True
+    set_float32_matmul_precision: str = "high"  # "high" or "highest" (if supported)
+    enable_tf32: bool = True  # uses allow_tf32 legacy flags if available
 
     # Runtime computed
     batch_size: int = 0
@@ -64,6 +68,10 @@ class Args:
 
 
 class SparseCheckpointHumanoidReward(gym.Wrapper):
+    """
+    +1 for each new forward checkpoint crossed (spacing meters) while healthy (torso z in range).
+    Reward is 0 otherwise. Optional terminal bonus if far enough at episode end.
+    """
     def __init__(
         self,
         env,
@@ -79,6 +87,7 @@ class SparseCheckpointHumanoidReward(gym.Wrapper):
         self.terminal_bonus_threshold = terminal_bonus_threshold
         self.terminal_bonus = terminal_bonus
         self.living_reward = living_reward
+
         self._highest_checkpoint = 0
         self._initial_x = 0.0
 
@@ -118,6 +127,7 @@ class SparseCheckpointHumanoidReward(gym.Wrapper):
 
         info["checkpoints_reached"] = self._highest_checkpoint
         info["forward_distance"] = forward_distance
+
         return obs, sparse_reward, terminated, truncated, info
 
 
@@ -144,7 +154,6 @@ def make_env(env_id, idx, capture_video, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         return env
-
     return thunk
 
 
@@ -155,19 +164,30 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, dart_enabled=True):
         super().__init__()
+        self.dart_enabled = dart_enabled
         obs_shape = int(np.array(envs.single_observation_space.shape).prod())
         act_shape = int(np.prod(envs.single_action_space.shape))
         hidden = 256
 
-        self.critic = nn.Sequential(
+        self.critic_base = nn.Sequential(
             layer_init(nn.Linear(obs_shape, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
+
+        if self.dart_enabled:
+            self.critic_res = nn.Sequential(
+                layer_init(nn.Linear(obs_shape, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, 1), std=1.0),
+            )
+
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(obs_shape, hidden)),
             nn.Tanh(),
@@ -177,11 +197,18 @@ class Agent(nn.Module):
         )
         self.actor_logstd = nn.Parameter(torch.ones(1, act_shape) * -1.0)
 
-    def get_value(self, x):
-        return self.critic(x)
+    def get_components(self, x):
+        v_base = self.critic_base(x)
+        if self.dart_enabled:
+            v_res = self.critic_res(x)
+        else:
+            v_res = torch.zeros_like(v_base)
+        return v_base, v_res
 
-    def get_action_and_value(self, x, action=None):
-        value = self.critic(x)
+    def get_action_and_stats(self, x, action=None):
+        # One critic forward for base/res (avoids duplicated base pass from your original rollout)
+        v_base, v_res = self.get_components(x)
+        v_total = v_base + v_res
 
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -193,12 +220,15 @@ class Agent(nn.Module):
 
         logprob = dist.log_prob(action).sum(1)
         entropy = dist.entropy().sum(1)
-        return action, logprob, entropy, value
+        return action, logprob, entropy, v_total, v_base
 
 
-def maybe_compile(agent: Agent, mode: str):
+def maybe_torch_compile(agent: Agent, mode: str):
+    # Compile only the pure-MLP submodules (more likely to help; fewer graph breaks)
     agent.actor_mean = torch.compile(agent.actor_mean, mode=mode)
-    agent.critic = torch.compile(agent.critic, mode=mode)
+    agent.critic_base = torch.compile(agent.critic_base, mode=mode)
+    if agent.dart_enabled:
+        agent.critic_res = torch.compile(agent.critic_res, mode=mode)
     return agent
 
 
@@ -207,7 +237,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-
+    warmup_steps = int(args.total_timesteps * args.dart_warmup_frac)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
     if args.track:
@@ -228,12 +258,14 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # Determinism tends to reduce perf; keep it only if you need strict reproducibility.
     torch.backends.cudnn.deterministic = args.torch_deterministic
     torch.backends.cudnn.benchmark = not args.torch_deterministic
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(args.set_float32_matmul_precision)
 
+    # TF32 knobs (legacy flags; still widely used)
     if args.enable_tf32:
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -253,20 +285,30 @@ if __name__ == "__main__":
     else:
         envs = gym.vector.SyncVectorEnv(env_fns)
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box)
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, dart_enabled=args.dart_enabled).to(device)
     if args.torch_compile and device.type == "cuda":
-        agent = maybe_compile(agent, mode=args.compile_mode)
+        agent = maybe_torch_compile(agent, mode=args.compile_mode)
 
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    base_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd] + list(agent.critic_base.parameters())
+    optimizer_base = optim.Adam(base_params, lr=args.learning_rate, eps=1e-5)
+
+    if args.dart_enabled:
+        optimizer_res = optim.Adam(
+            agent.critic_res.parameters(),
+            lr=args.learning_rate * args.dart_lr_scale,
+            eps=1e-5,
+        )
 
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device)
     logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
     rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
-    values = torch.zeros((args.num_steps, args.num_envs), device=device)
+
+    values_total = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values_base = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     global_step = 0
     start_time = time.time()
@@ -278,16 +320,24 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_iterations + 1):
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+            lrnow = frac * args.learning_rate
+            optimizer_base.param_groups[0]["lr"] = lrnow
+            if args.dart_enabled:
+                optimizer_res.param_groups[0]["lr"] = lrnow * args.dart_lr_scale
 
+        # Rollout
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
+            is_residual_active = args.dart_enabled and (global_step > warmup_steps)
             with torch.inference_mode():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action, logprob, _, v_total, v_base = agent.get_action_and_stats(next_obs)
+
+                active_value = v_total if is_residual_active else v_base
+                values_total[step] = active_value.flatten()
+                values_base[step] = v_base.flatten()
 
             actions[step] = action
             logprobs[step] = logprob
@@ -299,44 +349,74 @@ if __name__ == "__main__":
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
+        # Episode logging
         if isinstance(infos, dict) and "final_info" in infos:
             for info in infos["final_info"]:
                 if info and "episode" in info:
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"].item(), global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"].item(), global_step)
+                    ep_r = info["episode"]["r"].item()
+                    ep_l = info["episode"]["l"].item()
+                    writer.add_scalar("charts/episodic_return", ep_r, global_step)
+                    writer.add_scalar("charts/episodic_length", ep_l, global_step)
                     writer.add_scalar("charts/checkpoints_reached", info.get("checkpoints_reached", 0), global_step)
                     writer.add_scalar("charts/forward_distance", info.get("forward_distance", 0.0), global_step)
                     print(
-                        f"global_step={global_step}, episodic_return={info['episode']['r'].item():.2f}, "
-                        f"len={info['episode']['l'].item()}, checkpoints={info.get('checkpoints_reached', 0)}, "
+                        f"global_step={global_step}, episodic_return={ep_r:.2f}, "
+                        f"len={ep_l}, checkpoints={info.get('checkpoints_reached', 0)}, "
                         f"distance={info.get('forward_distance', 0.0):.2f}m"
                     )
 
+        # ===== DART / GAE returns =====
         with torch.inference_mode():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            is_residual_active = args.dart_enabled and (global_step > warmup_steps)
+            _, _, _, next_v_total, next_v_base = agent.get_action_and_stats(next_obs, action=None)
+            next_value_hat = (next_v_total if is_residual_active else next_v_base).reshape(1, -1)
+
             advantages = torch.zeros_like(rewards, device=device)
             lastgaelam = 0.0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
+                    nextvalues = next_value_hat
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                    nextvalues = values_total[t + 1]
+
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
                 lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 advantages[t] = lastgaelam
-            returns = advantages + values
 
+            returns_base = advantages + values_total
+
+        if args.dart_enabled:
+            with torch.inference_mode():
+                returns_res = torch.zeros_like(rewards, device=device)
+                lastgaelam_res = 0.0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value_hat
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values_total[t + 1]
+
+                    delta_res = rewards[t] + args.gamma * nextvalues * nextnonterminal - values_total[t]
+                    lastgaelam_res = delta_res + args.gamma * args.dart_lambda_res * nextnonterminal * lastgaelam_res
+                    returns_res[t] = lastgaelam_res + values_total[t]
+
+        # Flatten batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        b_returns_base = returns_base.reshape(-1)
+        b_values_base = values_base.reshape(-1)
+        if args.dart_enabled:
+            b_returns_res = returns_res.reshape(-1)
 
+        # PPO/DART updates
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        is_residual_active = args.dart_enabled and (global_step > warmup_steps)
 
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
@@ -344,7 +424,10 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                # Forward
+                _, newlogprob, entropy, _, _ = agent.get_action_and_stats(b_obs[mb_inds], b_actions[mb_inds])
+                new_v_base, new_v_res = agent.get_components(b_obs[mb_inds])
+
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -356,47 +439,74 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
+                # Policy loss
                 pg_loss1 = -mb_adv * ratio
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                newvalue = newvalue.view(-1)
+                # Base critic loss
+                newvalue_base = new_v_base.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds], -args.clip_coef, args.clip_coef
+                    v_loss_unclipped = (newvalue_base - b_returns_base[mb_inds]) ** 2
+                    v_clipped = b_values_base[mb_inds] + torch.clamp(
+                        newvalue_base - b_values_base[mb_inds],
+                        -args.clip_coef,
+                        args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    v_loss_clipped = (v_clipped - b_returns_base[mb_inds]) ** 2
+                    v_loss_base = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss_base = 0.5 * ((newvalue_base - b_returns_base[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss_base = pg_loss - args.ent_coef * entropy_loss + v_loss_base * args.vf_coef
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                optimizer_base.zero_grad(set_to_none=True)
+                loss_base.backward()
+                nn.utils.clip_grad_norm_(base_params, args.max_grad_norm)
+                optimizer_base.step()
+
+                # Residual critic loss (only after warmup)
+                if is_residual_active:
+                    newvalue_res = new_v_res.view(-1)
+                    target_res = b_returns_res[mb_inds] - b_values_base[mb_inds]
+                    loss_res = ((newvalue_res - target_res) ** 2).mean()
+
+                    optimizer_res.zero_grad(set_to_none=True)
+                    loss_res.backward()
+                    nn.utils.clip_grad_norm_(agent.critic_res.parameters(), args.max_grad_norm)
+                    optimizer_res.step()
+                else:
+                    loss_res = torch.tensor(0.0, device=device)
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
-        y_pred = b_values.detach().cpu().numpy()
-        y_true = b_returns.detach().cpu().numpy()
+        # Logging
+        y_pred = b_values_base.detach().cpu().numpy()
+        y_true = b_returns_base.detach().cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        sps = int(global_step / (time.time() - start_time))
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("charts/learning_rate", optimizer_base.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss_base", v_loss_base.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("charts/SPS", sps, global_step)
-        print("SPS:", sps)
+        writer.add_scalar("losses/explained_variance_base", explained_var, global_step)
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        if args.dart_enabled:
+            writer.add_scalar("dart/loss_res", loss_res.item(), global_step)
+            writer.add_scalar("dart/is_active", float(is_residual_active), global_step)
+            if is_residual_active:
+                with torch.inference_mode():
+                    writer.add_scalar(
+                        "dart/residual_target_mean",
+                        (b_returns_res - b_values_base).mean().item(),
+                        global_step,
+                    )
 
     if args.save_model:
         os.makedirs(f"/scratch/s/shahradm/cleanrl/{run_name}", exist_ok=True)
