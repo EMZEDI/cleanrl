@@ -87,11 +87,11 @@ def run_trial(
         "total-timesteps": total_timesteps,
         "num-envs": 64,
         "num-steps": 1024,
-        "track": False,  # No wandb on compute nodes
         "capture-video": False,
         "save-model": False,
         "seed": seed,
         "cuda": True,
+        "no-track": "",
     }
     
     # Merge parameters
