@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=tune_humanoid
-#SBATCH --partition=production-cluster
 #SBATCH --nodes=80
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
