@@ -13,11 +13,10 @@
 # ================================================================================
 # Massive-scale hyperparameter tuning for PPO vs DART on Humanoid-v4
 # 
-# Resources: 80 nodes × 4 GPUs × 3 trials/GPU = 960 parallel workers
-# Strategy: Exploit aggressive pruning in 3-hour window
-#   - Most trials pruned at 5M steps (~20 min) → ~8,640 trial starts
-#   - ~30% survive to 50M steps (~2.5 hrs) → ~2,880 completions
-#   - Can easily get 500+ quality trials per algorithm in single run!
+# Resources: N nodes × 4 GPUs × trials/GPU workers
+# Note: The current Optuna pruner in `cleanrl_utils/tune_ppo_dart_humanoid.py` prunes
+# based on `--num-seeds` steps (not timesteps), so with `NUM_SEEDS=1` most trials will
+# run full length unless they crash.
 # 
 # Usage:
 #   sbatch benchmark/tune_humanoid_820gpu.sh ppo     # Tune PPO
@@ -55,7 +54,6 @@ echo "Total workers per node: $((4 * $TRIALS_PER_GPU))"
 echo "Total GPUs in job: $(($SLURM_NNODES * 4))"
 echo "Total workers in job: $(($SLURM_NNODES * 4 * $TRIALS_PER_GPU))"
 echo "Time limit: 3 hours (optimized for fast scheduling)"
-echo "Strategy: Aggressive pruning → ~9K trial starts → ~3K completions"
 echo "========================================================================"
 
 # Load environment (uv)
@@ -64,6 +62,10 @@ source .env
 # Set environment variables for performance
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
+
+# Sanity check: ensure we're actually launching one task per allocated node.
+# This should print exactly $SLURM_NNODES lines.
+echo "srun sanity check (hostname lines should equal SLURM_NNODES=$SLURM_NNODES): $(srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 hostname | wc -l)"
 
 # Run tuning script on all nodes (launches multiple workers per GPU)
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 python cleanrl_utils/tune_ppo_dart_humanoid.py \
