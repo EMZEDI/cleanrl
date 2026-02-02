@@ -88,8 +88,6 @@ def run_trial(
         "num-envs": 64,
         "num-steps": 1024,
         "seed": seed,
-        "no-track": "",
-        "capture-video": "",
     }
     
     # Merge parameters
