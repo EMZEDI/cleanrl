@@ -51,7 +51,7 @@ class Args:
     async_shared_memory: bool = False
     async_context: Optional[str] = None  # e.g., "forkserver" sometimes helps on clusters
 
-    torch_compile: bool = True
+    torch_compile: bool = False
     compile_mode: str = "reduce-overhead"  # "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"
 
     set_float32_matmul_precision: str = "high"  # "high" or "highest" if supported

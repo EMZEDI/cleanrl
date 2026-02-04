@@ -14,6 +14,19 @@ sbatch benchmark/tune_humanoid_820gpu.sh ppo
 sbatch benchmark/tune_humanoid_820gpu.sh dart
 ```
 
+## Generic Tuning (any env + script)
+```bash
+# Usage:
+# sbatch benchmark/tune_generic.sh <env_id> <search_space> <script_path> [timesteps] [num_trials]
+
+sbatch benchmark/tune_generic.sh Humanoid-v4 ppo cleanrl/ppo_humanoid_sparse.py 50000000 500
+sbatch benchmark/tune_generic.sh Humanoid-v4 dart cleanrl/dart_humanoid_sparse_opt.py 50000000 500
+sbatch benchmark/tune_generic.sh Humanoid-v4 ppo_large_critic cleanrl/ppo_humanoid_sparse_large_critic.py 50000000 500
+
+# Pass extra fixed args (example disables torch_compile):
+# EXTRA_ARGS="--fixed-arg torch-compile=False" sbatch benchmark/tune_generic.sh ...
+```
+
 **Why 3 hours still works well:**
 - Very high parallelism yields lots of *started* trials quickly.
 - You can iterate allocations rapidly (submit multiple bursts) and then run final validation on top configs.
@@ -43,7 +56,7 @@ grep -c "Running with params" /scratch/shahradm/slurm_logs/tune_humanoid_*.out
 sqlite3 /scratch/shahradm/optuna_humanoid.db \
   "SELECT s.study_name, COUNT(*) AS n_trials FROM trials t JOIN studies s ON s.study_id=t.study_id GROUP BY s.study_name ORDER BY n_trials DESC;"
 
-# Optional: completed vs pruned vs failed counts (Optuna TrialState enums)
+# Optional: completed vs pruned vs failed counts (Optuna TrialState enums)****
 sqlite3 /scratch/shahradm/optuna_humanoid.db \
   "SELECT s.study_name, t.state, COUNT(*) AS n FROM trials t JOIN studies s ON s.study_id=t.study_id GROUP BY s.study_name, t.state ORDER BY s.study_name, t.state;"
 
@@ -56,6 +69,10 @@ sqlite3 /scratch/shahradm/optuna_humanoid.db \
 # Compare both algorithms
 python cleanrl_utils/analyze_optuna_results.py --compare
 
+# Analyze or compare arbitrary studies
+python cleanrl_utils/analyze_optuna_results.py --study-name ppo_Humanoid-v4_50M
+python cleanrl_utils/analyze_optuna_results.py --study-names ppo_Humanoid-v4_50M,dart_Humanoid-v4_50M --labels PPO,DART
+
 # Individual analysis
 python cleanrl_utils/analyze_optuna_results.py --algorithm ppo
 python cleanrl_utils/analyze_optuna_results.py --algorithm dart
@@ -66,11 +83,28 @@ python cleanrl_utils/analyze_optuna_results.py --algorithm dart
 sbatch benchmark/final_comparison.sh
 ```
 
+## Generic Final Validation (20 seeds)
+```bash
+# sbatch benchmark/final_eval_generic.sh <env_id> <script_path> <config_dir> [timesteps] [num_seeds]
+sbatch benchmark/final_eval_generic.sh Humanoid-v4 cleanrl/ppo_humanoid_sparse.py /scratch/shahradm/optuna_results/ppo_Humanoid-v4_50M 50000000 20
+```
+
+## One-command Pipeline (tune → analyze → final eval)
+```bash
+# bash benchmark/pipeline_submit.sh <env_id> <ppo_script> <dart_script> <ppo_large_script> [timesteps] [num_trials]
+bash benchmark/pipeline_submit.sh Humanoid-v4 \
+  cleanrl/ppo_humanoid_sparse.py \
+  cleanrl/dart_humanoid_sparse_opt.py \
+  cleanrl/ppo_humanoid_sparse_large_critic.py \
+  50000000 500
+```
+
 ## Key Locations
 - Database: `/scratch/shahradm/optuna_humanoid.db`
 - Results: `/scratch/shahradm/optuna_results/`
 - Logs: `/scratch/shahradm/slurm_logs/`
 - Best configs: `/scratch/shahradm/optuna_results/{ppo,dart}/`
+- Final eval summaries: `/scratch/shahradm/final_eval_results/`
 
 ## Resource Usage
 - **Tuning:** 600 GPUs × 20 hours = 12,000 GPU-hours (effective ~4,800 with pruning)

@@ -129,6 +129,29 @@ You may also use a prebuilt development environment hosted in Gitpod:
 
 [![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/#https://github.com/vwxyzjn/cleanrl)
 
+## Large-scale tuning utilities (cluster)
+
+This fork includes generic Optuna-based tuning helpers that accept any env and script path, plus a one-command pipeline that chains tuning → analysis → final eval (20 seeds) for PPO, DART, and PPO large-critic variants.
+
+Quick examples:
+
+```bash
+sbatch benchmark/tune_generic.sh Humanoid-v4 ppo cleanrl/ppo_humanoid_sparse.py 50000000 500
+sbatch benchmark/tune_generic.sh Humanoid-v4 dart cleanrl/dart_humanoid_sparse_opt.py 50000000 500
+sbatch benchmark/tune_generic.sh Humanoid-v4 ppo_large_critic cleanrl/ppo_humanoid_sparse_large_critic.py 50000000 500
+
+bash benchmark/pipeline_submit.sh Humanoid-v4 \
+  cleanrl/ppo_humanoid_sparse.py \
+  cleanrl/dart_humanoid_sparse_opt.py \
+  cleanrl/ppo_humanoid_sparse_large_critic.py \
+  50000000 500
+```
+
+Docs:
+
+- [TUNING_GUIDE.md](TUNING_GUIDE.md)
+- [TUNING_QUICKREF.md](TUNING_QUICKREF.md)
+
 ## Algorithms Implemented
 
 
