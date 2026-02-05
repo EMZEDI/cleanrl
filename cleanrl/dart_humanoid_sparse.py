@@ -366,6 +366,26 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam
 
             returns_base = advantages + values_total
+            
+            # Compute Monte Carlo returns for value accuracy metric
+            mc_returns = torch.zeros_like(rewards, device=device)
+            mc_return = 0.0
+            for t in reversed(range(args.num_steps)):
+                mc_return = rewards[t] + args.gamma * mc_return * (1.0 - dones[t])
+                mc_returns[t] = mc_return
+            
+            # Compute value prediction error (MSE between predicted values and true MC returns)
+            value_pred_error = ((values_total - mc_returns) ** 2).mean().item()
+            writer.add_scalar("value_metrics/prediction_mse", value_pred_error, global_step)
+            writer.add_scalar("value_metrics/mean_predicted_value", values_total.mean().item(), global_step)
+            writer.add_scalar("value_metrics/mean_mc_return", mc_returns.mean().item(), global_step)
+            writer.add_scalar("value_metrics/residual_active", float(is_residual_active), global_step)
+            
+            # Also track base and residual components separately
+            if args.dart_enabled:
+                writer.add_scalar("value_metrics/mean_base_value", values_base.mean().item(), global_step)
+                base_pred_error = ((values_base - mc_returns) ** 2).mean().item()
+                writer.add_scalar("value_metrics/base_prediction_mse", base_pred_error, global_step)
 
         if args.dart_enabled:
             with torch.no_grad():

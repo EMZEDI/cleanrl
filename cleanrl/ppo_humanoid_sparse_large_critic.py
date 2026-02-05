@@ -311,6 +311,19 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
+            
+            # Compute Monte Carlo returns for value accuracy metric
+            mc_returns = torch.zeros_like(rewards).to(device)
+            mc_return = 0.0
+            for t in reversed(range(args.num_steps)):
+                mc_return = rewards[t] + args.gamma * mc_return * (1.0 - dones[t])
+                mc_returns[t] = mc_return
+            
+            # Compute value prediction error (MSE between predicted values and true MC returns)
+            value_pred_error = ((values - mc_returns) ** 2).mean().item()
+            writer.add_scalar("value_metrics/prediction_mse", value_pred_error, global_step)
+            writer.add_scalar("value_metrics/mean_predicted_value", values.mean().item(), global_step)
+            writer.add_scalar("value_metrics/mean_mc_return", mc_returns.mean().item(), global_step)
 
         # flatten
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
