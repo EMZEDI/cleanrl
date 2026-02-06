@@ -26,23 +26,26 @@ else
     echo "PostgreSQL cluster already exists at $PGDATA"
 fi
 
-# Start PostgreSQL
+# Start PostgreSQL (if not already running)
 echo "Starting PostgreSQL server..."
-pg_ctl -D "$PGDATA" -l /scratch/shahradm/optuna_pg.log start
+pg_ctl -D "$PGDATA" -l /scratch/shahradm/optuna_pg.log start 2>&1 | grep -v "already running" || true
 
 # Wait for server to be ready
-sleep 3
+sleep 2
 
 # Create optuna database and user
 echo "Creating optuna user and database..."
-createdb optuna_humanoid 2>/dev/null || echo "Database optuna_humanoid might already exist"
-createuser optuna 2>/dev/null || echo "User optuna might already exist"
-
-# Grant privileges
-psql -d optuna_humanoid << EOF
-ALTER USER optuna WITH PASSWORD 'optuna_secure_pwd_2026';
+psql -h localhost << EOSQL
+CREATE USER IF NOT EXISTS optuna WITH PASSWORD 'optuna_secure_pwd_2026';
+CREATE DATABASE IF NOT EXISTS optuna_humanoid OWNER optuna;
 GRANT ALL PRIVILEGES ON DATABASE optuna_humanoid TO optuna;
-EOF
+\c optuna_humanoid
+GRANT ALL ON SCHEMA public TO optuna;
+EOSQL
+
+if [ $? -ne 0 ]; then
+    echo "Warning: User/database creation had issues, but this may be OK if they already exist."
+fi
 
 echo "PostgreSQL setup complete!"
 echo ""
