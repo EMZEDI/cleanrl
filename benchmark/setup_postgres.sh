@@ -35,11 +35,11 @@ sleep 3
 
 # Create optuna database and user
 echo "Creating optuna user and database..."
-createdb -U postgres optuna_humanoid 2>/dev/null || echo "Database optuna_humanoid already exists"
-createuser -U postgres optuna 2>/dev/null || echo "User optuna already exists"
+createdb optuna_humanoid 2>/dev/null || echo "Database optuna_humanoid might already exist"
+createuser optuna 2>/dev/null || echo "User optuna might already exist"
 
 # Grant privileges
-psql -U postgres -d optuna_humanoid << EOF
+psql -d optuna_humanoid << EOF
 ALTER USER optuna WITH PASSWORD 'optuna_secure_pwd_2026';
 GRANT ALL PRIVILEGES ON DATABASE optuna_humanoid TO optuna;
 EOF
