@@ -41,13 +41,20 @@ sleep 2
 
 # Create optuna database and user (connect to template1 which always exists)
 echo "Creating optuna user and database..."
+
+# Create user (ignore error if exists)
+psql -h localhost -d template1 -c "CREATE USER optuna WITH PASSWORD 'optuna_secure_pwd_2026';" 2>/dev/null || echo "User optuna already exists"
+
+# Create database (ignore error if exists)
+psql -h localhost -d template1 -c "CREATE DATABASE optuna_humanoid;" 2>/dev/null || echo "Database optuna_humanoid already exists"
+
+# Grant privileges
 psql -h localhost -d template1 << EOSQL
-CREATE USER IF NOT EXISTS optuna WITH PASSWORD 'optuna_secure_pwd_2026';
-CREATE DATABASE IF NOT EXISTS optuna_humanoid OWNER optuna;
+ALTER DATABASE optuna_humanoid OWNER TO optuna;
 GRANT ALL PRIVILEGES ON DATABASE optuna_humanoid TO optuna;
 EOSQL
 
-# Grant schema permissions
+# Grant schema permissions (connect directly to the database now)
 psql -h localhost -d optuna_humanoid << EOSQL
 GRANT ALL ON SCHEMA public TO optuna;
 EOSQL
