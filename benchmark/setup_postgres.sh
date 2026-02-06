@@ -5,6 +5,7 @@
 set -e
 
 # Create PostgreSQL data directory
+# PASSWD: optuna_secure_pwd_2026
 PGDATA="/scratch/shahradm/optuna_pg_data"
 PGPORT=5432
 PGHOST="localhost"
@@ -28,24 +29,28 @@ fi
 
 # Start PostgreSQL (if not already running)
 echo "Starting PostgreSQL server..."
-pg_ctl -D "$PGDATA" -l /scratch/shahradm/optuna_pg.log start 2>&1 | grep -v "already running" || true
+STATUS=$(pg_ctl -D "$PGDATA" status 2>&1 || true)
+if echo "$STATUS" | grep -q "server is running"; then
+    echo "PostgreSQL is already running (PID: $(echo $STATUS | grep -oP 'PID: \K[0-9]+'))"
+else
+    pg_ctl -D "$PGDATA" -l /scratch/shahradm/optuna_pg.log start 2>&1 | grep -v "already running" || true
+fi
 
 # Wait for server to be ready
 sleep 2
 
-# Create optuna database and user
+# Create optuna database and user (connect to template1 which always exists)
 echo "Creating optuna user and database..."
-psql -h localhost << EOSQL
+psql -h localhost -d template1 << EOSQL
 CREATE USER IF NOT EXISTS optuna WITH PASSWORD 'optuna_secure_pwd_2026';
 CREATE DATABASE IF NOT EXISTS optuna_humanoid OWNER optuna;
 GRANT ALL PRIVILEGES ON DATABASE optuna_humanoid TO optuna;
-\c optuna_humanoid
-GRANT ALL ON SCHEMA public TO optuna;
 EOSQL
 
-if [ $? -ne 0 ]; then
-    echo "Warning: User/database creation had issues, but this may be OK if they already exist."
-fi
+# Grant schema permissions
+psql -h localhost -d optuna_humanoid << EOSQL
+GRANT ALL ON SCHEMA public TO optuna;
+EOSQL
 
 echo "PostgreSQL setup complete!"
 echo ""
