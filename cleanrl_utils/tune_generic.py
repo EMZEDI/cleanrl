@@ -7,7 +7,7 @@ Supports PPO, DART, and PPO-large-critic (same space as PPO) by providing:
   - search-space label
 
 Runs one Optuna coordinator per node and keeps GPUs busy with local worker
-processes (children do not talk to SQLite directly).
+processes (children do not talk to PostgreSQL directly - only the coordinator on each node does).
 """
 
 import argparse
@@ -268,7 +268,7 @@ def main():
     parser.add_argument("--search-space", type=str, required=True, choices=["ppo", "dart", "ppo_large_critic"],
                         help="Search space to use")
     parser.add_argument("--study-name", type=str, default=None, help="Optuna study name")
-    parser.add_argument("--storage", type=str, default="sqlite:////scratch/shahradm/optuna_humanoid.db",
+    parser.add_argument("--storage", type=str, default="postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid",
                         help="Optuna storage URL")
     parser.add_argument("--num-gpus", type=int, default=4, help="GPUs per node")
     parser.add_argument("--trials-per-gpu", type=int, default=3, help="Concurrent trials per GPU")
@@ -303,6 +303,7 @@ def main():
     print(f"Seeds per trial: {args.num_seeds}")
     print("=" * 80)
 
+    # PostgreSQL connection validation happens implicitly when Optuna connects
     if args.storage.startswith("sqlite:///"):
         db_path = args.storage.replace("sqlite:///", "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)

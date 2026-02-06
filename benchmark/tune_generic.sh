@@ -34,7 +34,7 @@ NUM_ENVS=${NUM_ENVS:-64}
 NUM_STEPS=${NUM_STEPS:-1024}
 
 STUDY_NAME=${STUDY_NAME:-"${SEARCH_SPACE}_${ENV_ID}_$((TOTAL_TIMESTEPS/1000000))M"}
-STORAGE=${STORAGE:-"sqlite:////scratch/shahradm/optuna_humanoid.db"}
+STORAGE=${STORAGE:-"postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid"}
 
 mkdir -p /scratch/shahradm/slurm_logs
 mkdir -p /scratch/shahradm/optuna_results

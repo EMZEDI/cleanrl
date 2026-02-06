@@ -4,7 +4,23 @@ Distributed Optuna-based hyperparameter optimization designed for large multi-no
 
 ## Quick Start
 
-### 1. Launch Hyperparameter Tuning (3-hour burst)
+### 1. Setup Database (Run Once)
+
+Before running any tuning, initialize the PostgreSQL database on the head node:
+
+```bash
+# Initialize and start PostgreSQL
+bash benchmark/setup_postgres.sh
+```
+
+### 2. Launch Hyperparameter Tuning (3-hour burst)
+
+Syntax:
+```bash
+sbatch benchmark/tune_generic.sh <env_id> <search_space> <script_path> <total_timesteps> <num_trials>
+```
+
+Example (Humanoid-v4):
 
 ```bash
 # In your cleanrl fork directory, with .env available
@@ -24,12 +40,13 @@ sbatch benchmark/tune_generic.sh Humanoid-v4 ppo_large_critic cleanrl/ppo_humano
 - Trials per GPU configured via `TRIALS_PER_GPU` (default 3)
 - Pruning is currently seed-step based (not timestep based) unless you change it
 
-### 2. Analyze Results
+### 3. Analyze Results
 
 ```bash
 # After jobs complete, on head node with Python environment
 
 # Analyze a study
+# Syntax: python cleanrl_utils/analyze_optuna_results.py --study-name <study_name>
 python cleanrl_utils/analyze_optuna_results.py --study-name ppo_Humanoid-v4_50M
 
 # Compare multiple studies
@@ -41,18 +58,29 @@ python cleanrl_utils/analyze_optuna_results.py --study-names ppo_Humanoid-v4_50M
 - Best configurations saved to `/scratch/shahradm/optuna_results/{study_name}/`
 - Plots: optimization history, parameter importances, PPO vs DART comparison
 
-### 3. Run Final Validation (Top configs × 20 seeds each)
+### 4. Run Final Validation (Top configs × 20 seeds each)
 
 ```bash
+# Syntax: sbatch benchmark/final_eval_generic.sh <env_id> <script_path> <results_dir> <timesteps> <seeds>
 # Run final evaluation for a single study (top 3 configs × 20 seeds)
 sbatch benchmark/final_eval_generic.sh Humanoid-v4 cleanrl/ppo_humanoid_sparse.py /scratch/shahradm/optuna_results/ppo_Humanoid-v4_50M 50000000 20
 
 # Evaluate end models (default 10 episodes) and save JSON summaries
 # Override with EVAL_EPISODES as needed:
 # EVAL_EPISODES=20 sbatch benchmark/final_eval_generic.sh ...
-### 4. One-command Pipeline (tune → analyze → final eval)
+### 5. One-command Pipeline (tune → analyze → final eval)
+
+```bash<env_id> \
+    <ppo_script_path> \
+    <dart_script_path> \
+    <ppo_large_critic_script_path> \
+    <total_timesteps> <num_trials>
+```
+
+Example:
 
 ```bash
+bash benchmark/pipeline_submit.sh 
 bash benchmark/pipeline_submit.sh Humanoid-v4 \
     cleanrl/ppo_humanoid_sparse.py \
     cleanrl/dart_humanoid_sparse_opt.py \
@@ -138,8 +166,8 @@ You can add extra fixed args via `EXTRA_ARGS="--fixed-arg key=value"` when launc
 ---
 
 ## Advanced Usage
-
-### Test on Single Node (4 GPUs)
+<script_path> \
+    --env-id <env_id>(4 GPUs)
 
 ```bash
 # Interactive test on 1 node
@@ -163,10 +191,10 @@ python cleanrl_utils/tune_generic.py \
 squeue -u $USER
 
 # Tail logs from specific node
-tail -f /scratch/shahradm/slurm_logs/tune_humanoid_*.out
+tail -f /scratch/shahradm/slurm_logs/tune_generic_*.out
 
 # Count trials per study
-sqlite3 /scratch/shahradm/optuna_humanoid.db \
+psql -U optuna -d optuna_humanoid -h localhost -c \
     "SELECT s.study_name, COUNT(*) FROM trials t JOIN studies s ON s.study_id=t.study_id GROUP BY s.study_name;"
 ```
 
@@ -175,12 +203,10 @@ sqlite3 /scratch/shahradm/optuna_humanoid.db \
 ```bash
 # If you want even more trials, just resubmit!
 # Optuna handles continuation automatically
-sbatch benchmark/tune_generic.sh Humanoid-v4 ppo cleanrl/ppo_humanoid_sparse.py 50000000 500
-# ... wait 3 hours ...
-sbatch benchmark/tune_generic.sh Humanoid-v4 ppo cleanrl/ppo_humanoid_sparse.py 50000000 500
+sbatch benchmark/tune_generic.sh <env_id> <search_space> <script_path> <timesteps> <trials>
 
 # Or use fewer nodes for longer allocation (if preferred)
-sbatch --nodes=20 --time=12:00:00 benchmark/tune_generic.sh Humanoid-v4 ppo cleanrl/ppo_humanoid_sparse.py 50000000 500
+sbatch --nodes=20 --time=12:00:00 benchmark/tune_generic.sh <env_id> <search_space> <script_path> <timesteps> <trials>
 ```
 
 **Pro tip:** Multiple 3-hour jobs > One 12-hour job because:
@@ -190,7 +216,7 @@ sbatch --nodes=20 --time=12:00:00 benchmark/tune_generic.sh Humanoid-v4 ppo clea
 
 ### Tune Only Critical Parameters
 
-Edit [cleanrl_utils/tune_ppo_dart_humanoid.py](cleanrl_utils/tune_ppo_dart_humanoid.py):
+Edit [cleanrl_utils/tune_generic.py](cleanrl_utils/tune_generic.py):
 
 ```python
 # Simplified PPO search (learning rate + lambda only)
@@ -218,34 +244,32 @@ Memory usage per trial: ~8GB (32 envs) to ~15GB (128 envs)
 
 ## Troubleshooting
 
-### SQLite Lock Contention
+### Database Issues
 
-If many workers cause database lock issues, switch to PostgreSQL:
+If the PostgreSQL server stops (e.g., after a node reboot), restart it:
 
 ```bash
-# On head node, start PostgreSQL (if available)
-module load postgresql
-pg_ctl -D /scratch/shahradm/optuna_pg_data start
+# Check status
+pg_ctl -D /scratch/shahradm/optuna_pg_data status
 
-# Update storage URL in scripts
-STORAGE="postgresql://user:pass@headnode:5432/optuna_humanoid"
+# Start if stopped
+pg_ctl -D /scratch/shahradm/optuna_pg_data -l /scratch/shahradm/optuna_pg.log start
 ```
 
 ### Out of Memory
 
 Reduce batch size in trials:
 ```bash
-# Edit tune_ppo_dart_humanoid.py, change fixed_params:
-"num-envs": 32,  # Instead of 64
+# Increase fixed_arg when launching:
+sbatch benchmark/tune_generic.sh ... EXTRA_ARGS="--fixed-arg num-envs=32"
 ```
 
 ### Slow Filesystem I/O
 
 Use local node storage for tensorboard logs:
 ```bash
-# In tune_ppo_dart_humanoid.py, before running trial:
-export TMPDIR=/tmp/node_local
-# Then rsync results back to /scratch at end
+# In your training script (e.g. ppo.py), support a --tmp-dir arg or similar:
+sbatch benchmark/tune_generic.sh ... EXTRA_ARGS="--fixed-arg tmp-dir=/tmp/node_local"
 ```
 
 ### Failed Nodes
@@ -258,7 +282,7 @@ import optuna
 study = optuna.load_study(
     study_name="ppo_Humanoid-v4_50M",
     storage="sqlite:////scratch/shahradm/optuna_humanoid.db"
-)
+)postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid
 
 # Get failed trials
 failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
@@ -295,7 +319,7 @@ print(f"{len(failed)} failed trials")
 All scripts use these defaults (can override via command-line):
 
 - **Storage:** `/scratch/shahradm/optuna_humanoid.db`
-- **Output:** `/scratch/shahradm/optuna_results/`
+- **Output:** `/postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid
 - **Logs:** `/scratch/shahradm/slurm_logs/`
 - **Runs:** `runs/{experiment_name}/`
 
