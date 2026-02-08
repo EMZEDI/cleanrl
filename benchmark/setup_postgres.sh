@@ -27,6 +27,21 @@ else
     echo "PostgreSQL cluster already exists at $PGDATA"
 fi
 
+# Allow remote connections for compute nodes
+CONF="$PGDATA/postgresql.conf"
+HBA="$PGDATA/pg_hba.conf"
+
+if ! grep -q "^listen_addresses" "$CONF"; then
+    echo "listen_addresses = '*'" >> "$CONF"
+fi
+
+if ! grep -q "optuna.*0.0.0.0/0" "$HBA"; then
+    echo "host all optuna 0.0.0.0/0 md5" >> "$HBA"
+fi
+if ! grep -q "optuna.*::/0" "$HBA"; then
+    echo "host all optuna ::/0 md5" >> "$HBA"
+fi
+
 # Start PostgreSQL (if not already running)
 echo "Starting PostgreSQL server..."
 STATUS=$(pg_ctl -D "$PGDATA" status 2>&1 || true)
@@ -38,6 +53,9 @@ fi
 
 # Wait for server to be ready
 sleep 2
+
+# Reload to pick up config changes
+pg_ctl -D "$PGDATA" reload || true
 
 # Create optuna database and user (connect to template1 which always exists)
 echo "Creating optuna user and database..."
