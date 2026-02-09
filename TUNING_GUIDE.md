@@ -68,9 +68,12 @@ sbatch benchmark/final_eval_generic.sh Humanoid-v4 cleanrl/ppo_humanoid_sparse.p
 # Evaluate end models (default 10 episodes) and save JSON summaries
 # Override with EVAL_EPISODES as needed:
 # EVAL_EPISODES=20 sbatch benchmark/final_eval_generic.sh ...
+```
+
 ### 5. One-command Pipeline (tune → analyze → final eval)
 
-```bash<env_id> \
+```bash
+bash benchmark/pipeline_submit.sh <env_id> \
     <ppo_script_path> \
     <dart_script_path> \
     <ppo_large_critic_script_path> \
@@ -80,13 +83,11 @@ sbatch benchmark/final_eval_generic.sh Humanoid-v4 cleanrl/ppo_humanoid_sparse.p
 Example:
 
 ```bash
-bash benchmark/pipeline_submit.sh 
 bash benchmark/pipeline_submit.sh Humanoid-v4 \
     cleanrl/ppo_humanoid_sparse.py \
     cleanrl/dart_humanoid_sparse_opt.py \
     cleanrl/ppo_humanoid_sparse_large_critic.py \
     50000000 500
-```
 ```
 
 **Expected results:**
@@ -117,7 +118,7 @@ benchmark/
 1. **SLURM job** requests N nodes × 4 GPUs
 2. Each node sources `.env` to load uv and your Python environment
 3. Each node runs [cleanrl_utils/tune_generic.py](cleanrl_utils/tune_generic.py) via [benchmark/tune_generic.sh](benchmark/tune_generic.sh)
-4. **One Optuna coordinator per node** talks to SQLite; child GPU workers do not
+4. **One Optuna coordinator per node** talks to PostgreSQL; child GPU workers do not
 5. **Trials per GPU** keeps each GPU busy (default 3)
 6. Each trial runs `total-timesteps` with your fixed args and tuned hyperparameters
 
@@ -166,8 +167,6 @@ You can add extra fixed args via `EXTRA_ARGS="--fixed-arg key=value"` when launc
 ---
 
 ## Advanced Usage
-<script_path> \
-    --env-id <env_id>(4 GPUs)
 
 ```bash
 # Interactive test on 1 node
@@ -194,7 +193,7 @@ squeue -u $USER
 tail -f /scratch/shahradm/slurm_logs/tune_generic_*.out
 
 # Count trials per study
-psql -U optuna -d optuna_humanoid -h localhost -c \
+psql -U optuna -d optuna_humanoid -h vulcan1 -c \
     "SELECT s.study_name, COUNT(*) FROM trials t JOIN studies s ON s.study_id=t.study_id GROUP BY s.study_name;"
 ```
 
@@ -281,8 +280,8 @@ import optuna
 
 study = optuna.load_study(
     study_name="ppo_Humanoid-v4_50M",
-    storage="sqlite:////scratch/shahradm/optuna_humanoid.db"
-)postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid
+    storage="postgresql://optuna:optuna_secure_pwd_2026@vulcan1:5432/optuna_humanoid"
+)
 
 # Get failed trials
 failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
@@ -318,8 +317,8 @@ print(f"{len(failed)} failed trials")
 
 All scripts use these defaults (can override via command-line):
 
-- **Storage:** `/scratch/shahradm/optuna_humanoid.db`
-- **Output:** `/postgresql://optuna:optuna_secure_pwd_2026@localhost:5432/optuna_humanoid
+- **Storage:** `postgresql://optuna:optuna_secure_pwd_2026@vulcan1:5432/optuna_humanoid`
+- **Output:** `/scratch/shahradm/optuna_results/`
 - **Logs:** `/scratch/shahradm/slurm_logs/`
 - **Runs:** `runs/{experiment_name}/`
 

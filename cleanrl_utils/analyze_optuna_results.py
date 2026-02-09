@@ -224,14 +224,35 @@ def main():
                         help="Comma-separated labels for comparison plots")
     parser.add_argument("--compare", action="store_true",
                         help="Compare PPO and DART results (legacy)")
-    parser.add_argument("--storage", type=str, default="sqlite:////scratch/shahradm/optuna_humanoid.db",
+    parser.add_argument("--storage", type=str, default="postgresql://optuna:optuna_secure_pwd_2026@vulcan1:5432/optuna_humanoid",
                         help="Optuna storage URL")
     parser.add_argument("--output-dir", type=str, default="/scratch/shahradm/optuna_results",
                         help="Output directory for plots and configs")
     parser.add_argument("--top-n", type=int, default=10,
                         help="Number of top trials to display/save")
+    parser.add_argument("--plain", action="store_true", help="Print output without Rich formatting")
     
     args = parser.parse_args()
+
+    if args.plain:
+        class PlainConsole:
+            def print(self, *args, **kwargs):
+                # Strip rich tags roughly or just print
+                msg = " ".join(str(a) for a in args)
+                # Remove [color] tags
+                import re
+                clean_msg = re.sub(r'\[/?[a-z\s]+\]', '', msg)
+                print(clean_msg)
+        global console
+        console = PlainConsole()
+
+    print(f"[analyze] storage={args.storage}")
+    if args.study_names:
+        print(f"[analyze] study_names={args.study_names}")
+    if args.study_name:
+        print(f"[analyze] study_name={args.study_name}")
+    if args.algorithm:
+        print(f"[analyze] algorithm={args.algorithm}")
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

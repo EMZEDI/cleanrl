@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=tune_generic
-#SBATCH --nodes=60
+#SBATCH --nodes=10
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64

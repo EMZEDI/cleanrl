@@ -11,9 +11,11 @@ processes (children do not talk to PostgreSQL directly - only the coordinator on
 """
 
 import argparse
+import glob
 import multiprocessing as mp
 import os
 import runpy
+import signal
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -221,6 +223,44 @@ def run_node_coordinator(
         return fut, trial
 
     in_flight: Dict[Any, optuna.Trial] = {}
+    
+    def _handle_sigterm(signum, frame):
+        print(f"[rank {rank}] Received signal {signum}. Saving partial results...")
+        for fut, tr in in_flight.items():
+            try:
+                # Reconstruct seed to find run dictionary
+                base_seed = int(tr.number) + 1
+                seed = base_seed + rank * 1_000_000
+                
+                # Look for runs folder matching the seed
+                pattern = f"runs/*__{seed}__*"
+                matches = glob.glob(pattern)
+                
+                if not matches:
+                    print(f"[rank {rank}] No run dir found for trial {tr.number} (seed {seed})")
+                    study.tell(tr, state=TrialState.FAIL)
+                    continue
+
+                # Take most recent match if multiple
+                run_dir = sorted(matches)[-1]
+                val = extract_metric_from_tensorboard(run_dir, metric_tag, last_n=last_n)
+                
+                if val == float("-inf"):
+                    print(f"[rank {rank}] No metric data for trial {tr.number}")
+                    study.tell(tr, state=TrialState.FAIL)
+                else:
+                    print(f"[rank {rank}] Recovered value {val:.2f} for trial {tr.number}")
+                    # Mark as COMPLETE so Optuna uses the data, even if partial
+                    study.tell(tr, val, state=TrialState.COMPLETE)
+            except Exception as e:
+                print(f"[rank {rank}] Failed to save trial {tr.number}: {e}")
+        
+        print(f"[rank {rank}] Exiting after signal handling.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
     with ProcessPoolExecutor(max_workers=total_workers, mp_context=mp.get_context("spawn")) as ex:
         to_launch = min(trials_this_node, total_workers)
         for _ in range(to_launch):
