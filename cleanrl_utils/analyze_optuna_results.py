@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.table import Table
 
 
+IS_PLAIN = False
 console = Console()
 
 
@@ -67,25 +68,23 @@ def print_trial_summary(study: optuna.Study, top_n: int = 10):
         console.print(f"  Std: {np.std(values):.2f}")
         console.print(f"  Median: {np.median(values):.2f}")
         
-        # Top trials table
         best_trials = get_best_trials(study, n=top_n)
-        
-        table = Table(title=f"Top {len(best_trials)} Trials")
-        table.add_column("Rank", style="cyan")
-        table.add_column("Trial", style="magenta")
-        table.add_column("Value", style="green")
-        table.add_column("Params", style="yellow")
-        
-        for rank, trial in enumerate(best_trials, 1):
-            params_str = ", ".join([f"{k}={v:.4g}" for k, v in trial.params.items()])
-            table.add_row(
-                str(rank),
-                str(trial.number),
-                f"{trial.value:.2f}",
-                params_str
-            )
-        
-        console.print(table)
+
+        if IS_PLAIN:
+            console.print(f"Top {len(best_trials)} Trials (plain)")
+            for rank, trial in enumerate(best_trials, 1):
+                params_str = ", ".join([f"{k}={v:.4g}" for k, v in trial.params.items()])
+                console.print(f"{rank:2d}) trial={trial.number} value={trial.value:.3f} params={params_str}")
+        else:
+            table = Table(title=f"Top {len(best_trials)} Trials")
+            table.add_column("Rank", style="cyan")
+            table.add_column("Trial", style="magenta")
+            table.add_column("Value", style="green")
+            table.add_column("Params", style="yellow")
+            for rank, trial in enumerate(best_trials, 1):
+                params_str = ", ".join([f"{k}={v:.4g}" for k, v in trial.params.items()])
+                table.add_row(str(rank), str(trial.number), f"{trial.value:.2f}", params_str)
+            console.print(table)
 
 
 def save_best_configs(study: optuna.Study, output_dir: Path, top_n: int = 3):
@@ -107,7 +106,10 @@ def save_best_configs(study: optuna.Study, output_dir: Path, top_n: int = 3):
         with open(output_file, "w") as f:
             json.dump(config, f, indent=2)
         
-        console.print(f"Saved config: {output_file}")
+        if IS_PLAIN:
+            print(f"Saved config: {output_file}")
+        else:
+            console.print(f"Saved config: {output_file}")
 
 
 def plot_optimization_history(study: optuna.Study, output_dir: Path):
@@ -141,7 +143,10 @@ def plot_optimization_history(study: optuna.Study, output_dir: Path):
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
     
-    console.print(f"Saved plot: {output_file}")
+    if IS_PLAIN:
+        print(f"Saved plot: {output_file}")
+    else:
+        console.print(f"Saved plot: {output_file}")
 
 
 def plot_param_importances(study: optuna.Study, output_dir: Path):
@@ -166,9 +171,15 @@ def plot_param_importances(study: optuna.Study, output_dir: Path):
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close()
         
-        console.print(f"Saved plot: {output_file}")
+        if IS_PLAIN:
+            print(f"Saved plot: {output_file}")
+        else:
+            console.print(f"Saved plot: {output_file}")
     except Exception as e:
-        console.print(f"[yellow]Could not compute parameter importances: {e}[/yellow]")
+        if IS_PLAIN:
+            print(f"Could not compute parameter importances: {e}")
+        else:
+            console.print(f"[yellow]Could not compute parameter importances: {e}[/yellow]")
 
 
 def compare_studies(studies: List[optuna.Study], labels: List[str], output_dir: Path):
@@ -188,17 +199,27 @@ def compare_studies(studies: List[optuna.Study], labels: List[str], output_dir: 
     values_lists = [[_trial_value(t) for t in completed] for completed in completed_lists]
 
     console.print("\n[bold cyan]Study Comparison[/bold cyan]")
-    table = Table()
-    table.add_column("Metric", style="cyan")
-    for label in labels:
-        table.add_column(label, style="green")
-
-    table.add_row("Trials", *[str(len(v)) for v in values_lists])
-    table.add_row("Best", *[f"{max(v):.2f}" for v in values_lists])
-    table.add_row("Mean", *[f"{np.mean(v):.2f}" for v in values_lists])
-    table.add_row("Median", *[f"{np.median(v):.2f}" for v in values_lists])
-    table.add_row("Std", *[f"{np.std(v):.2f}" for v in values_lists])
-    console.print(table)
+    if IS_PLAIN:
+        metrics = [
+            ("Trials", [str(len(v)) for v in values_lists]),
+            ("Best", [f"{max(v):.2f}" for v in values_lists]),
+            ("Mean", [f"{np.mean(v):.2f}" for v in values_lists]),
+            ("Median", [f"{np.median(v):.2f}" for v in values_lists]),
+            ("Std", [f"{np.std(v):.2f}" for v in values_lists]),
+        ]
+        for name, vals in metrics:
+            console.print(f"{name}: " + " | ".join(vals))
+    else:
+        table = Table()
+        table.add_column("Metric", style="cyan")
+        for label in labels:
+            table.add_column(label, style="green")
+        table.add_row("Trials", *[str(len(v)) for v in values_lists])
+        table.add_row("Best", *[f"{max(v):.2f}" for v in values_lists])
+        table.add_row("Mean", *[f"{np.mean(v):.2f}" for v in values_lists])
+        table.add_row("Median", *[f"{np.median(v):.2f}" for v in values_lists])
+        table.add_row("Std", *[f"{np.std(v):.2f}" for v in values_lists])
+        console.print(table)
 
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.boxplot(values_lists, labels=labels)
@@ -209,7 +230,10 @@ def compare_studies(studies: List[optuna.Study], labels: List[str], output_dir: 
     output_file = output_dir / "study_comparison.png"
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
     plt.close()
-    console.print(f"Saved comparison plot: {output_file}")
+    if IS_PLAIN:
+        print(f"Saved comparison plot: {output_file}")
+    else:
+        console.print(f"Saved comparison plot: {output_file}")
 
 
 def main():
@@ -234,7 +258,9 @@ def main():
     
     args = parser.parse_args()
 
+    global IS_PLAIN
     if args.plain:
+        IS_PLAIN = True
         class PlainConsole:
             def print(self, *args, **kwargs):
                 # Strip rich tags roughly or just print
