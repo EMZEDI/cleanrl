@@ -16,13 +16,30 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
-from rich.console import Console
-from rich.table import Table
+try:
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:
+    Console = None
+    Table = None
 
 
 IS_PLAIN = False
-console = Console()
+console = None
 
+
+def get_console():
+    global console
+    if console is None:
+        if Console:
+            console = Console()
+        else:
+            print("Rich not installed or disabled, using plain output.")
+            class PlainConsole:
+                def print(self, *args, **kwargs):
+                    print(*args)
+            console = PlainConsole()
+    return console
 
 def load_study(study_name: str, storage: str) -> optuna.Study:
     """Load Optuna study from storage."""
@@ -30,7 +47,7 @@ def load_study(study_name: str, storage: str) -> optuna.Study:
         study = optuna.load_study(study_name=study_name, storage=storage)
         return study
     except Exception as e:
-        console.print(f"[red]Error loading study '{study_name}': {e}[/red]")
+        get_console().print(f"[red]Error loading study '{study_name}': {e}[/red]")
         raise
 
 
@@ -250,7 +267,7 @@ def main():
                         help="Compare PPO and DART results (legacy)")
     parser.add_argument("--storage", type=str, default="postgresql://optuna:optuna_secure_pwd_2026@vulcan1:5432/optuna_humanoid",
                         help="Optuna storage URL")
-    parser.add_argument("--output-dir", type=str, default="/scratch/shahradm/optuna_results",
+    parser.add_argument("--output-dir", type=str, default="optuna_results",
                         help="Output directory for plots and configs")
     parser.add_argument("--top-n", type=int, default=10,
                         help="Number of top trials to display/save")
@@ -259,6 +276,8 @@ def main():
     args = parser.parse_args()
 
     global IS_PLAIN
+    global console
+    
     if args.plain:
         IS_PLAIN = True
         class PlainConsole:
@@ -269,8 +288,20 @@ def main():
                 import re
                 clean_msg = re.sub(r'\[/?[a-z\s]+\]', '', msg)
                 print(clean_msg)
-        global console
         console = PlainConsole()
+    elif console is None:
+        if Console:
+            console = Console()
+        else:
+            print("Rich library not found. Using plain mode.")
+            IS_PLAIN = True
+            class PlainConsole:
+                def print(self, *args, **kwargs):
+                    msg = " ".join(str(a) for a in args)
+                    import re
+                    clean_msg = re.sub(r'\[/?[a-z\s]+\]', '', msg)
+                    print(clean_msg)
+            console = PlainConsole()
 
     print(f"[analyze] storage={args.storage}")
     if args.study_names:
@@ -345,3 +376,6 @@ def main():
         return
 
     console.print("[red]Please specify --study-name/--study-names or --algorithm/--compare[/red]")
+
+if __name__ == "__main__":
+    main()
