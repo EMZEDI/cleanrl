@@ -52,15 +52,26 @@ def load_study(study_name: str, storage: str) -> optuna.Study:
 
 
 def get_best_trials(study: optuna.Study, n: int = 10) -> List[optuna.trial.FrozenTrial]:
-    """Get top N trials by objective value."""
-    all_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+    """Get top N trials by objective value (including running trials with intermediate values)."""
+    # Filter for COMPLETE or RUNNING trials that have some value data
+    valid_states = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.RUNNING)
+    all_trials = [t for t in study.trials if t.state in valid_states]
+    # Filter out running trials that have no reported values yet
+    all_trials = [t for t in all_trials if _trial_value(t) != float("-inf")]
+    
     all_trials.sort(key=lambda t: _trial_value(t), reverse=True)
     return all_trials[:n]
 
 
 def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
-    value = trial.value
-    return float(value) if value is not None else float("-inf")
+    """Get value from trial. If value is None (e.g. running), try last intermediate value."""
+    if trial.value is not None:
+        return float(trial.value)
+    if trial.intermediate_values:
+        # Use the value from the latest step
+        last_step = max(trial.intermediate_values.keys())
+        return float(trial.intermediate_values[last_step])
+    return float("-inf")
 
 
 def print_trial_summary(study: optuna.Study, top_n: int = 10):
@@ -70,16 +81,21 @@ def print_trial_summary(study: optuna.Study, top_n: int = 10):
     console.print(f"Total trials: {len(study.trials)}")
     
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    running = [t for t in study.trials if t.state == optuna.trial.TrialState.RUNNING]
     pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
     failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
     
     console.print(f"  Completed: {len(completed)}")
-    console.print(f"  Pruned: {len(pruned)}")
-    console.print(f"  Failed: {len(failed)}")
+    console.print(f"  Running:   {len(running)}")
+    console.print(f"  Pruned:    {len(pruned)}")
+    console.print(f"  Failed:    {len(failed)}")
     
-    if completed:
-        values = [_trial_value(t) for t in completed if t.value is not None]
-        console.print("\n[bold]Statistics:[/bold]")
+    # Analyze both completed and running trials (if they have reported values)
+    analyzable = completed + [t for t in running if t.intermediate_values]
+    
+    if analyzable:
+        values = [_trial_value(t) for t in analyzable]
+        console.print("\n[bold]Statistics (Completed + Running):[/bold]")
         console.print(f"  Best: {max(values):.2f}")
         console.print(f"  Mean: {np.mean(values):.2f}")
         console.print(f"  Std: {np.std(values):.2f}")
@@ -90,17 +106,20 @@ def print_trial_summary(study: optuna.Study, top_n: int = 10):
         if IS_PLAIN:
             console.print(f"Top {len(best_trials)} Trials (plain)")
             for rank, trial in enumerate(best_trials, 1):
+                state_str = "RUN" if trial.state == optuna.trial.TrialState.RUNNING else "CMP"
                 params_str = ", ".join([f"{k}={v:.4g}" for k, v in trial.params.items()])
-                console.print(f"{rank:2d}) trial={trial.number} value={trial.value:.3f} params={params_str}")
+                console.print(f"{rank:2d}) [{state_str}] trial={trial.number} value={_trial_value(trial):.3f} params={params_str}")
         else:
             table = Table(title=f"Top {len(best_trials)} Trials")
             table.add_column("Rank", style="cyan")
+            table.add_column("State", style="blue")
             table.add_column("Trial", style="magenta")
             table.add_column("Value", style="green")
             table.add_column("Params", style="yellow")
             for rank, trial in enumerate(best_trials, 1):
+                state_str = "RUN" if trial.state == optuna.trial.TrialState.RUNNING else "CMP"
                 params_str = ", ".join([f"{k}={v:.4g}" for k, v in trial.params.items()])
-                table.add_row(str(rank), str(trial.number), f"{trial.value:.2f}", params_str)
+                table.add_row(str(rank), state_str, str(trial.number), f"{_trial_value(trial):.2f}", params_str)
             console.print(table)
 
 
@@ -131,14 +150,18 @@ def save_best_configs(study: optuna.Study, output_dir: Path, top_n: int = 3):
 
 def plot_optimization_history(study: optuna.Study, output_dir: Path):
     """Plot optimization history."""
-    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    # Plot both completed and runing trials
+    analyzable = [t for t in study.trials if t.state in [optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.RUNNING]]
+    analyzable = [t for t in analyzable if _trial_value(t) != float("-inf")]
     
-    if not completed:
-        console.print("[yellow]No completed trials to plot[/yellow]")
+    if not analyzable:
+        console.print("[yellow]No analyzable trials to plot[/yellow]")
         return
     
-    trial_numbers = [t.number for t in completed]
-    values = [_trial_value(t) for t in completed if t.value is not None]
+    analyzable.sort(key=lambda t: t.number)
+    
+    trial_numbers = [t.number for t in analyzable]
+    values = [_trial_value(t) for t in analyzable]
     
     # Compute running best
     running_best = []
@@ -204,15 +227,17 @@ def compare_studies(studies: List[optuna.Study], labels: List[str], output_dir: 
     if len(studies) != len(labels):
         raise ValueError("studies and labels must be same length")
 
-    completed_lists = [
-        [t for t in s.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
-        for s in studies
-    ]
+    completed_lists = []
+    for s in studies:
+        # Get all trials that have a valid value (Complete or Running with intermediate)
+        trials = [t for t in s.trials if t.state in [optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.RUNNING]]
+        trials = [t for t in trials if _trial_value(t) != float("-inf")]
+        completed_lists.append(trials)
 
     if any(len(c) == 0 for c in completed_lists):
-        console.print("[yellow]Need completed trials for all studies to compare[/yellow]")
+        console.print("[yellow]Need analyzable trials for all studies to compare[/yellow]")
         return
-
+    
     values_lists = [[_trial_value(t) for t in completed] for completed in completed_lists]
 
     console.print("\n[bold cyan]Study Comparison[/bold cyan]")
