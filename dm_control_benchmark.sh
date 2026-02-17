@@ -23,7 +23,7 @@
 #   1. Copy project to $SCRATCH:  cp -r /path/to/cleanrl $SCRATCH/cleanrl
 #   2. Submit:  cd $SCRATCH/cleanrl && sbatch dm_control_benchmark.sh
 #   3. After job completes, sync wandb from login node:
-#      wandb sync $SCRATCH/dm_control_bench/wandb/*
+#      wandb beta sync -n 20 $SCRATCH/dm_control_bench/wandb/*
 
 set -euo pipefail
 
