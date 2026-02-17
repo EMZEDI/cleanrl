@@ -1,0 +1,183 @@
+#!/bin/bash
+#SBATCH --array=0-3
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=192
+#SBATCH --time=12:00:00
+#SBATCH --job-name=dm_bench
+#SBATCH --output=dm_bench_slurm-%A_%a.out
+#SBATCH --error=dm_bench_slurm-%A_%a.err
+#SBATCH --account=aip-rrabba
+
+# =============================================================================
+# dm_control PPO vs DART vs PPO-Double Benchmark
+# Multi-node via SLURM job array: 4 CPU nodes, each runs ~375 tasks
+# Each node packs ~180 serial jobs across 192 cores with GNU Parallel
+#
+# Total: 50 envs × 10 seeds × 3 methods = 1,500 runs
+# 4 nodes × 180 slots = 720 concurrent → ~2 batches per node
+# Estimated wall time: ~7–10 hours per node
+# =============================================================================
+#
+# Usage:
+#   1. Copy project to $SCRATCH:  cp -r /path/to/cleanrl $SCRATCH/cleanrl
+#   2. Submit:  cd $SCRATCH/cleanrl && sbatch dm_control_benchmark.sh
+#   3. After job completes, sync wandb from login node:
+#      wandb sync $SCRATCH/dm_control_bench/wandb/*
+
+set -euo pipefail
+
+# ------ Prevent BLAS/OpenMP thread oversubscription ------
+# Each Python process should use exactly 1 thread (physics is single-threaded)
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# ------ Wandb: offline mode (no internet on compute nodes) ------
+export WANDB_MODE=offline
+BENCH_DIR="${SCRATCH}/dm_control_bench"
+export WANDB_DIR="${BENCH_DIR}/wandb"
+mkdir -p "${WANDB_DIR}"
+mkdir -p "${BENCH_DIR}/runs"
+
+source .env
+
+# cd into the project (must be on $SCRATCH for write access)
+PROJ_DIR="${SCRATCH}/cleanrl"
+cd "${PROJ_DIR}"
+
+NUM_NODES=4  # Must match --array=0-(N-1)
+NODE_ID=${SLURM_ARRAY_TASK_ID}
+
+echo "========================================================"
+echo "Node:          $(hostname)"
+echo "Array element: ${NODE_ID} of ${NUM_NODES}"
+echo "Cores:         ${SLURM_CPUS_PER_TASK}"
+echo "Project dir:   ${PROJ_DIR}"
+echo "Bench output:  ${BENCH_DIR}"
+echo "Wandb dir:     ${WANDB_DIR}"
+echo "Start time:    $(date)"
+echo "========================================================"
+
+# ------ Define environments, seeds, methods ------
+ENVS=(
+    dm_control/acrobot-swingup-v0
+    dm_control/acrobot-swingup_sparse-v0
+    dm_control/ball_in_cup-catch-v0
+    dm_control/cartpole-balance-v0
+    dm_control/cartpole-balance_sparse-v0
+    dm_control/cartpole-swingup-v0
+    dm_control/cartpole-swingup_sparse-v0
+    dm_control/cartpole-two_poles-v0
+    dm_control/cartpole-three_poles-v0
+    dm_control/cheetah-run-v0
+    dm_control/dog-stand-v0
+    dm_control/dog-walk-v0
+    dm_control/dog-trot-v0
+    dm_control/dog-run-v0
+    dm_control/dog-fetch-v0
+    dm_control/finger-spin-v0
+    dm_control/finger-turn_easy-v0
+    dm_control/finger-turn_hard-v0
+    dm_control/fish-upright-v0
+    dm_control/fish-swim-v0
+    dm_control/hopper-stand-v0
+    dm_control/hopper-hop-v0
+    dm_control/humanoid-stand-v0
+    dm_control/humanoid-walk-v0
+    dm_control/humanoid-run-v0
+    dm_control/humanoid-run_pure_state-v0
+    dm_control/humanoid_CMU-stand-v0
+    dm_control/humanoid_CMU-run-v0
+    dm_control/lqr-lqr_2_1-v0
+    dm_control/lqr-lqr_6_2-v0
+    dm_control/manipulator-bring_ball-v0
+    dm_control/manipulator-bring_peg-v0
+    dm_control/manipulator-insert_ball-v0
+    dm_control/manipulator-insert_peg-v0
+    dm_control/pendulum-swingup-v0
+    dm_control/point_mass-easy-v0
+    dm_control/point_mass-hard-v0
+    dm_control/quadruped-walk-v0
+    dm_control/quadruped-run-v0
+    dm_control/quadruped-escape-v0
+    dm_control/quadruped-fetch-v0
+    dm_control/reacher-easy-v0
+    dm_control/reacher-hard-v0
+    dm_control/stacker-stack_2-v0
+    dm_control/stacker-stack_4-v0
+    dm_control/swimmer-swimmer6-v0
+    dm_control/swimmer-swimmer15-v0
+    dm_control/walker-stand-v0
+    dm_control/walker-walk-v0
+    dm_control/walker-run-v0
+)
+
+SEEDS=(1 2 3 4 5 6 7 8 9 10)
+
+WANDB_PROJECT="dm_control_ppo_vs_dart"
+TOTAL_STEPS=8000000
+
+# Methods: script path + exp-name (indexed arrays for deterministic ordering across nodes)
+# Hyperparams are baked into the scripts (lr=3e-4, ent_coef=0.01, etc.)
+# Batching matches cleanrl base: num_envs=1, num_steps=2048, update_epochs=10, num_minibatches=32
+METHOD_SCRIPTS=(
+    "cleanrl/ppo_dm_control.py"
+    "cleanrl/dart_dm_control.py"
+    "cleanrl/ppo_double_dm_control.py"
+)
+METHOD_NAMES=(
+    "ppo_dm_control"
+    "dart_dm_control"
+    "ppo_double_dm_control"
+)
+NUM_METHODS=${#METHOD_SCRIPTS[@]}
+
+# ------ Generate this node's task list (round-robin across array elements) ------
+MY_TASKFILE="${BENCH_DIR}/tasks_node${NODE_ID}_${SLURM_ARRAY_JOB_ID}.txt"
+> "${MY_TASKFILE}"
+
+TASK_IDX=0
+for env in "${ENVS[@]}"; do
+    for seed in "${SEEDS[@]}"; do
+        for (( m=0; m<NUM_METHODS; m++ )); do
+            if (( TASK_IDX % NUM_NODES == NODE_ID )); then
+                echo "python ${METHOD_SCRIPTS[$m]} --env-id ${env} --seed ${seed} --total-timesteps ${TOTAL_STEPS} --exp-name ${METHOD_NAMES[$m]} --wandb-project-name ${WANDB_PROJECT} --track" >> "${MY_TASKFILE}"
+            fi
+            TASK_IDX=$(( TASK_IDX + 1 ))
+        done
+    done
+done
+
+NTASKS_TOTAL=$(( ${#ENVS[@]} * ${#SEEDS[@]} * NUM_METHODS ))
+MY_NTASKS=$(wc -l < "${MY_TASKFILE}")
+echo "Total tasks (all nodes): ${NTASKS_TOTAL}"
+echo "This node's tasks:       ${MY_NTASKS}"
+echo "Parallel slots:          180  (of 192 cores, 12 reserved for OS/overhead)"
+echo "Estimated batches:       $(( (MY_NTASKS + 179) / 180 ))"
+echo ""
+
+# ------ Run with GNU Parallel ------
+# -j 180       : 180 concurrent jobs (leaves 12 cores for OS)
+# --joblog     : tracks which tasks completed (enables --resume on resubmit)
+# --resume     : skip already-completed tasks if resubmitted
+# --progress   : show progress bar
+# --halt soon,fail=10%  : stop if >10% of tasks fail (catch systemic issues)
+JOBLOG="${BENCH_DIR}/parallel_joblog_node${NODE_ID}_${SLURM_ARRAY_JOB_ID}.txt"
+
+parallel \
+    -j 180 \
+    --joblog "${JOBLOG}" \
+    --resume \
+    --progress \
+    --halt soon,fail=10% \
+    < "${MY_TASKFILE}"
+
+echo "========================================================"
+echo "Node ${NODE_ID} completed at $(date)"
+echo "Job log: ${JOBLOG}"
+echo ""
+echo "To sync wandb runs (from a login node with internet):"
+echo "  wandb sync ${WANDB_DIR}/*"
+echo "========================================================"
