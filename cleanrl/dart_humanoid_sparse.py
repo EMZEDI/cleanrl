@@ -376,15 +376,47 @@ if __name__ == "__main__":
             
             # Compute value prediction error (MSE between predicted values and true MC returns)
             value_pred_error = ((values_total - mc_returns) ** 2).mean().item()
+            base_pred_error = ((values_base - mc_returns) ** 2).mean().item()
+            mse_improvement = base_pred_error - value_pred_error
+
+            # Unified analysis namespace (preferred)
+            writer.add_scalar("analysis/mse_v_total", value_pred_error, global_step)
+            writer.add_scalar("analysis/mse_v_base", base_pred_error, global_step)
+            writer.add_scalar("analysis/mse_improvement", mse_improvement, global_step)
+            writer.add_scalar("analysis/mean_v_total", values_total.mean().item(), global_step)
+            writer.add_scalar("analysis/mean_mc_return", mc_returns.mean().item(), global_step)
+
+            # Backward-compatible aliases
             writer.add_scalar("value_metrics/prediction_mse", value_pred_error, global_step)
             writer.add_scalar("value_metrics/mean_predicted_value", values_total.mean().item(), global_step)
             writer.add_scalar("value_metrics/mean_mc_return", mc_returns.mean().item(), global_step)
             writer.add_scalar("value_metrics/residual_active", float(is_residual_active), global_step)
+
+            # Residual diagnostics (V_res should correct V_base errors)
+            values_res = values_total - values_base
+            residual_target = mc_returns - values_base
+            writer.add_scalar("dart/mean_base_value", values_base.mean().item(), global_step)
+            writer.add_scalar("dart/mean_residual_value", values_res.mean().item(), global_step)
+            writer.add_scalar("value_metrics/mean_residual_value", values_res.mean().item(), global_step)
+            writer.add_scalar(
+                "value_metrics/residual_prediction_mse",
+                ((values_res - residual_target) ** 2).mean().item(),
+                global_step,
+            )
+
+            # Advantage-quality diagnostic: Corr(A_hat, A_true)
+            b_adv = advantages.reshape(-1).detach().cpu().numpy()
+            b_true_adv = (mc_returns - values_total).reshape(-1).detach().cpu().numpy()
+            if np.std(b_adv) > 1e-12 and np.std(b_true_adv) > 1e-12:
+                adv_corr = float(np.corrcoef(b_adv, b_true_adv)[0, 1])
+            else:
+                adv_corr = 0.0
+            writer.add_scalar("analysis/advantage_correlation", adv_corr, global_step)
+            writer.add_scalar("value_metrics/advantage_correlation", adv_corr, global_step)
             
             # Also track base and residual components separately
             if args.dart_enabled:
                 writer.add_scalar("value_metrics/mean_base_value", values_base.mean().item(), global_step)
-                base_pred_error = ((values_base - mc_returns) ** 2).mean().item()
                 writer.add_scalar("value_metrics/base_prediction_mse", base_pred_error, global_step)
 
         if args.dart_enabled:

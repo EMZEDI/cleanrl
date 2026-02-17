@@ -337,9 +337,28 @@ if __name__ == "__main__":
             
             # Compute value prediction error (MSE between predicted values and true MC returns)
             value_pred_error = ((values - mc_returns) ** 2).mean().item()
+            # Unified analysis namespace (preferred)
+            writer.add_scalar("analysis/mse_v_total", value_pred_error, global_step)
+            writer.add_scalar("analysis/mse_v_base", value_pred_error, global_step)
+            writer.add_scalar("analysis/mse_improvement", 0.0, global_step)
+            writer.add_scalar("analysis/mean_v_total", values.mean().item(), global_step)
+            writer.add_scalar("analysis/mean_mc_return", mc_returns.mean().item(), global_step)
+
+            # Backward-compatible aliases
             writer.add_scalar("value_metrics/prediction_mse", value_pred_error, global_step)
             writer.add_scalar("value_metrics/mean_predicted_value", values.mean().item(), global_step)
             writer.add_scalar("value_metrics/mean_mc_return", mc_returns.mean().item(), global_step)
+
+            # Advantage-quality diagnostic: Corr(A_hat, A_true)
+            # A_true approximated with MC-return-based advantage under current value baseline.
+            b_adv = advantages.reshape(-1).detach().cpu().numpy()
+            b_true_adv = (mc_returns - values).reshape(-1).detach().cpu().numpy()
+            if np.std(b_adv) > 1e-12 and np.std(b_true_adv) > 1e-12:
+                adv_corr = float(np.corrcoef(b_adv, b_true_adv)[0, 1])
+            else:
+                adv_corr = 0.0
+            writer.add_scalar("analysis/advantage_correlation", adv_corr, global_step)
+            writer.add_scalar("value_metrics/advantage_correlation", adv_corr, global_step)
 
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)

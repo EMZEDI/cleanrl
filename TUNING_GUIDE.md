@@ -149,6 +149,46 @@ You can add extra fixed args via `EXTRA_ARGS="--fixed-arg key=value"` when launc
 
 ---
 
+## Value-Function Analysis Metrics (Wandb)
+
+The humanoid PPO/DART scripts now log a unified value-analysis namespace under `analysis/*`.
+
+### Core metrics (compare PPO vs DART directly)
+
+- `analysis/mse_v_total`: Empirical value error $\mathbb{E}[(V(s)-G^{MC})^2]$ for the active critic.
+    - Lower is better.
+- `analysis/mse_v_base`: Base critic error against MC return.
+    - For PPO, this equals `analysis/mse_v_total` (single critic).
+- `analysis/mse_improvement`: `mse_v_base - mse_v_total`.
+    - Positive means DART residual is improving value fit.
+- `analysis/advantage_correlation`: $\mathrm{Corr}(\hat A_t, A_t^{true})$ where $A_t^{true}\approx G_t^{MC}-V(s_t)$.
+    - Higher is better; indicates training advantages align with MC-based advantages.
+- `analysis/mean_v_total`, `analysis/mean_mc_return`:
+    - Track calibration/drift of value scale vs return scale.
+
+### DART-only diagnostics
+
+- `dart/mean_base_value`: Mean of base critic predictions.
+- `dart/mean_residual_value`: Mean residual contribution.
+    - Positive residual suggests underestimation correction by base critic.
+    - Negative residual suggests overestimation correction by base critic.
+
+### How these guide tuning decisions
+
+1. If `analysis/mse_v_total` is flat/high for both PPO and DART:
+     - Reduce `learning-rate`, increase `update-epochs`, or increase `num-minibatches`.
+2. If DART has weak/negative `analysis/mse_improvement`:
+     - Increase `dart-lr-scale` slightly or reduce `dart-warmup-frac`.
+     - If unstable, do the opposite (lower `dart-lr-scale`, later warmup).
+3. If `analysis/advantage_correlation` is low/noisy:
+     - Increase rollout quality (more timesteps/envs), tune `gae-lambda`, or reduce policy update aggressiveness.
+4. If `analysis/mean_v_total` diverges far from `analysis/mean_mc_return`:
+     - Value function is miscalibrated; tune value-related settings first (`vf-coef`, LR, clipping behavior).
+
+> Note: legacy tags under `value_metrics/*` are still logged for backward compatibility.
+
+---
+
 ## Resource Estimates
 
 ### Per Trial
