@@ -189,7 +189,6 @@ parallel \
     -j 120 \
     --joblog "${JOBLOG}" \
     --resume \
-    --progress \
     --halt never \
     < "${MY_TASKFILE}"
 
