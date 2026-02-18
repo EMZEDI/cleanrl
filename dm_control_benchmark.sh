@@ -3,6 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=192
+#SBATCH --mem=0
 #SBATCH --time=12:00:00
 #SBATCH --job-name=dm_bench
 #SBATCH --output=dm_bench_slurm-%A_%a.out
