@@ -8,7 +8,7 @@
 #SBATCH --job-name=dm_bench
 #SBATCH --output=dm_bench_slurm-%A_%a.out
 #SBATCH --error=dm_bench_slurm-%A_%a.err
-#SBATCH --account=aip-rrabba
+#SBATCH --account=def-rrabba
 
 # =============================================================================
 # dm_control PPO vs DART vs PPO-Double Benchmark
@@ -23,11 +23,12 @@
 # =============================================================================
 #
 # Usage:
-#   1. Copy + install:  cp -r /path/to/cleanrl $SCRATCH/cleanrl
-#                       cd $SCRATCH/cleanrl
-#                       uv sync --extra dm_control   # installs shimmy, dm-control, mujoco
-#   2. Submit:          cd $SCRATCH/cleanrl && sbatch dm_control_benchmark.sh
+#   1. Install (once):  cd /path/to/cleanrl && uv sync --extra dm_control
+#   2. Submit:          cd /path/to/cleanrl && sbatch dm_control_benchmark.sh
 #   3. Sync wandb:      wandb beta sync -n 20 $SCRATCH/dm_control_bench/wandb/wandb/offline-run-*
+#
+# Code runs from the submit directory (your home/project fs — fast reads).
+# All write-heavy I/O (wandb, tensorboard runs/, task files) goes to $SCRATCH.
 
 set -euo pipefail
 
@@ -45,11 +46,16 @@ export WANDB_DIR="${BENCH_DIR}/wandb"
 mkdir -p "${WANDB_DIR}"
 mkdir -p "${BENCH_DIR}/runs"
 
-source .env
-
-# cd into the project (must be on $SCRATCH for write access)
-PROJ_DIR="${SCRATCH}/cleanrl"
+# Project dir = where sbatch was submitted from (home/project fs — fast reads)
+# All write-heavy I/O is redirected to $SCRATCH
+PROJ_DIR="${SLURM_SUBMIT_DIR}"
 cd "${PROJ_DIR}"
+
+# Symlink runs/ → $SCRATCH so tensorboard writes land on scratch
+# (Python scripts write to runs/ relative to CWD — no code changes needed)
+ln -sfn "${BENCH_DIR}/runs" "${PROJ_DIR}/runs"
+
+source .env
 
 PYTHON="${PROJ_DIR}/.venv/bin/python"
 
