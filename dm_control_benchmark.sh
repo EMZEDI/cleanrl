@@ -13,18 +13,21 @@
 # =============================================================================
 # dm_control PPO vs DART vs PPO-Double Benchmark
 # Multi-node via SLURM job array: 4 CPU nodes, each runs ~375 tasks
-# Each node packs ~180 serial jobs across 192 cores with GNU Parallel
+# Each node packs ~120 serial jobs across 192 cores with GNU Parallel
+# (capped at 120 for memory safety: large envs like dog/quadruped/humanoid_CMU
+#  can spike to 4GB RSS; 120 × 4GB = 480GB well within 755GB node RAM)
 #
 # Total: 50 envs × 10 seeds × 3 methods = 1,500 runs
-# 4 nodes × 180 slots = 720 concurrent → ~2 batches per node
-# Estimated wall time: ~7–10 hours per node
+# 4 nodes × 120 slots = 480 concurrent → ~4 batches per node
+# Estimated wall time: ~10–14 hours per node
 # =============================================================================
 #
 # Usage:
-#   1. Copy project to $SCRATCH:  cp -r /path/to/cleanrl $SCRATCH/cleanrl
-#   2. Submit:  cd $SCRATCH/cleanrl && sbatch dm_control_benchmark.sh
-#   3. After job completes, sync wandb from login node:
-#      wandb beta sync -n 20 $SCRATCH/dm_control_bench/wandb/*
+#   1. Copy + install:  cp -r /path/to/cleanrl $SCRATCH/cleanrl
+#                       cd $SCRATCH/cleanrl
+#                       uv sync --extra dm_control   # installs shimmy, dm-control, mujoco
+#   2. Submit:          cd $SCRATCH/cleanrl && sbatch dm_control_benchmark.sh
+#   3. Sync wandb:      wandb beta sync -n 20 $SCRATCH/dm_control_bench/wandb/wandb/offline-run-*
 
 set -euo pipefail
 
@@ -47,6 +50,15 @@ source .env
 # cd into the project (must be on $SCRATCH for write access)
 PROJ_DIR="${SCRATCH}/cleanrl"
 cd "${PROJ_DIR}"
+
+PYTHON="${PROJ_DIR}/.venv/bin/python"
+
+# ------ Preflight checks ------
+echo "Python:        ${PYTHON}"
+[[ -x "${PYTHON}" ]] || { echo "ERROR: venv not found at ${PYTHON}. Run: uv sync --extra dm_control"; exit 1; }
+"${PYTHON}" -c "import shimmy; import gymnasium; gymnasium.make('dm_control/pendulum-swingup-v0').close()" \
+    && echo "Preflight OK: dm_control namespace verified" \
+    || { echo "ERROR: dm_control import failed. Run: uv sync --extra dm_control"; exit 1; }
 
 NUM_NODES=4  # Must match --array=0-(N-1)
 NODE_ID=${SLURM_ARRAY_TASK_ID}
@@ -144,7 +156,7 @@ for env in "${ENVS[@]}"; do
     for seed in "${SEEDS[@]}"; do
         for (( m=0; m<NUM_METHODS; m++ )); do
             if (( TASK_IDX % NUM_NODES == NODE_ID )); then
-                echo "python ${METHOD_SCRIPTS[$m]} --env-id ${env} --seed ${seed} --total-timesteps ${TOTAL_STEPS} --exp-name ${METHOD_NAMES[$m]} --wandb-project-name ${WANDB_PROJECT} --track" >> "${MY_TASKFILE}"
+                echo "${PYTHON} ${METHOD_SCRIPTS[$m]} --env-id ${env} --seed ${seed} --total-timesteps ${TOTAL_STEPS} --exp-name ${METHOD_NAMES[$m]} --wandb-project-name ${WANDB_PROJECT} --track" >> "${MY_TASKFILE}"
             fi
             TASK_IDX=$(( TASK_IDX + 1 ))
         done
@@ -155,12 +167,12 @@ NTASKS_TOTAL=$(( ${#ENVS[@]} * ${#SEEDS[@]} * NUM_METHODS ))
 MY_NTASKS=$(wc -l < "${MY_TASKFILE}")
 echo "Total tasks (all nodes): ${NTASKS_TOTAL}"
 echo "This node's tasks:       ${MY_NTASKS}"
-echo "Parallel slots:          180  (of 192 cores, 12 reserved for OS/overhead)"
-echo "Estimated batches:       $(( (MY_NTASKS + 179) / 180 ))"
+echo "Parallel slots:          120  (of 192 cores; capped for memory safety ~480GB peak)"
+echo "Estimated batches:       $(( (MY_NTASKS + 119) / 120 ))"
 echo ""
 
 # ------ Run with GNU Parallel ------
-# -j 180       : 180 concurrent jobs (leaves 12 cores for OS)
+# -j 120       : 120 concurrent jobs (memory-safe for large dm_control envs)
 # --joblog     : tracks which tasks completed (enables --resume on resubmit)
 # --resume     : skip already-completed tasks if resubmitted
 # --progress   : show progress bar
@@ -168,11 +180,11 @@ echo ""
 JOBLOG="${BENCH_DIR}/parallel_joblog_node${NODE_ID}_${SLURM_ARRAY_JOB_ID}.txt"
 
 parallel \
-    -j 180 \
+    -j 120 \
     --joblog "${JOBLOG}" \
     --resume \
     --progress \
-    --halt soon,fail=10% \
+    --halt never \
     < "${MY_TASKFILE}"
 
 echo "========================================================"
