@@ -78,11 +78,11 @@ class Args:
     # DART Specific Arguments
     dart_enabled: bool = True
     """enable DART dual-critic architecture"""
-    dart_lambda_res: float = 0.995
+    dart_lambda_res: float = 0.9999
     """lambda for the high-bias residual GAE trace"""
-    dart_lr_scale: float = 0.3
+    dart_lr_scale: float = 0.5
     """learning rate multiplier for the residual critic"""
-    dart_warmup_frac: float = 0.4
+    dart_warmup_frac: float = 0.50
     """fraction of total timesteps before residual activates"""
 
     # to be filled in runtime
