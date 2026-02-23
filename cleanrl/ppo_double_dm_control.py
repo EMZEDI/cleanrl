@@ -24,71 +24,38 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = False
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
     upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
-    # Algorithm specific arguments
     env_id: str = "dm_control/cheetah-run-v0"
-    """the id of the environment"""
     total_timesteps: int = 8_000_000
-    """total timesteps of the experiments"""
     learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
     num_envs: int = 1
-    """the number of parallel game environments"""
     num_steps: int = 2048
-    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
-    """the number of mini-batches"""
     update_epochs: int = 10
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.01
-    """coefficient of the entropy"""
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     target_kl: float = None
-    """the target KL divergence threshold"""
 
-    # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
@@ -98,7 +65,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = gym.wrappers.FlattenObservation(env) 
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -106,7 +73,6 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
-
     return thunk
 
 
@@ -122,7 +88,6 @@ class Agent(nn.Module):
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         act_dim = np.prod(envs.single_action_space.shape)
 
-        # DOUBLE-SIZE Critic: 128-128 (vs standard 64-64)
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 128)),
             nn.Tanh(),
@@ -130,7 +95,6 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(128, 1), std=1.0),
         )
-        # DOUBLE-SIZE Actor: 128-128 (vs standard 64-64)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 128)),
             nn.Tanh(),
@@ -162,7 +126,6 @@ if __name__ == "__main__":
 
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -178,7 +141,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -186,7 +148,6 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # Env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
@@ -195,7 +156,6 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Storage
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -203,7 +163,6 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    # Start
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
@@ -239,7 +198,6 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-        # Bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -255,25 +213,29 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-            # Compute Monte Carlo returns for value accuracy metrics
+            # --- MC RETURNS FIX ---
             mc_returns = torch.zeros_like(rewards).to(device)
-            mc_return = 0.0
+            # Bootstrapping using the next state's predicted value
+            mc_return = next_value.reshape(-1) * (1.0 - next_done) 
             for t in reversed(range(args.num_steps)):
                 mc_return = rewards[t] + args.gamma * mc_return * (1.0 - dones[t])
                 mc_returns[t] = mc_return
 
-            # Value prediction error (MSE between predicted values and MC returns)
             value_pred_error = ((values - mc_returns) ** 2).mean().item()
+            
+            # --- VALUE BIAS NEW METRIC ---
+            value_bias = (values - mc_returns).mean().item()
 
             writer.add_scalar("analysis/mse_v_total", value_pred_error, global_step)
             writer.add_scalar("analysis/mean_v_total", values.mean().item(), global_step)
             writer.add_scalar("analysis/mean_mc_return", mc_returns.mean().item(), global_step)
+            writer.add_scalar("analysis/value_bias", value_bias, global_step)
 
             writer.add_scalar("value_metrics/prediction_mse", value_pred_error, global_step)
             writer.add_scalar("value_metrics/mean_predicted_value", values.mean().item(), global_step)
             writer.add_scalar("value_metrics/mean_mc_return", mc_returns.mean().item(), global_step)
+            writer.add_scalar("value_metrics/value_bias", value_bias, global_step)
 
-            # Advantage-quality diagnostic: Corr(A_hat, A_true)
             b_adv_np = advantages.reshape(-1).detach().cpu().numpy()
             b_true_adv_np = (mc_returns - values).reshape(-1).detach().cpu().numpy()
             if np.std(b_adv_np) > 1e-12 and np.std(b_true_adv_np) > 1e-12:
@@ -283,7 +245,6 @@ if __name__ == "__main__":
             writer.add_scalar("analysis/advantage_correlation", adv_corr, global_step)
             writer.add_scalar("value_metrics/advantage_correlation", adv_corr, global_step)
 
-        # Flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -291,7 +252,6 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -313,12 +273,10 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
