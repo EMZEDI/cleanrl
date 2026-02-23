@@ -4,14 +4,14 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=0
-#SBATCH --time=12:00:00
+#SBATCH --time=15:00:00
 #SBATCH --job-name=dm_bench
 #SBATCH --output=dm_bench_slurm-%A_%a.out
 #SBATCH --error=dm_bench_slurm-%A_%a.err
 #SBATCH --account=def-rrabba
 
 # =============================================================================
-# dm_control PPO vs DART vs PPO-Double Benchmark
+# dm_control Ablations: MC-Critic vs DART vs PPO-Double Benchmark
 # Multi-node via SLURM job array: 4 CPU nodes, each runs ~375 tasks
 # Each node packs ~120 serial jobs across 192 cores with GNU Parallel
 # (capped at 120 for memory safety: large envs like dog/quadruped/humanoid_CMU
@@ -135,19 +135,19 @@ ENVS=(
 
 SEEDS=(1 2 3 4 5 6 7 8 9 10)
 
-WANDB_PROJECT="dm_control_ppo_vs_dart"
+WANDB_PROJECT="dm_control_ppo_vs_dart_ablations"
 TOTAL_STEPS=8000000
 
 # Methods: script path + exp-name (indexed arrays for deterministic ordering across nodes)
 # Hyperparams are baked into the scripts (lr=3e-4, ent_coef=0.01, etc.)
 # Batching matches cleanrl base: num_envs=1, num_steps=2048, update_epochs=10, num_minibatches=32
 METHOD_SCRIPTS=(
-    # "cleanrl/ppo_dm_control.py"
+    "cleanrl/ppo_mc_critic_dm_control.py"
     "cleanrl/dart_dm_control.py"
     "cleanrl/ppo_double_dm_control.py"
 )
 METHOD_NAMES=(
-    # "ppo_dm_control"
+    "ppo_mc_critic_dm_control"
     "dart_dm_control"
     "ppo_double_dm_control"
 )
