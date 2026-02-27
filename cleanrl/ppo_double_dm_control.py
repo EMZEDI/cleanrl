@@ -27,6 +27,9 @@ class Args:
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = False
+    # In Args dataclass — add this field to BOTH scripts:
+    sparsity_threshold: float = 0.0
+    """Sparsity threshold for cartpole reward (0.0 = dense, 0.95 = original sparse)"""
     track: bool = False
     wandb_project_name: str = "cleanRL"
     wandb_entity: str = None
@@ -58,14 +61,22 @@ class Args:
     num_iterations: int = 0
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma):
+# Replace make_env in BOTH scripts with this:
+def make_env(env_id, idx, capture_video, run_name, gamma, sparsity_threshold=0.0):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env) 
+        env = gym.wrappers.FlattenObservation(env)
+
+        # ── Sparsity wrapper (only for cartpole-swingup) ──────────────────
+        if "cartpole" in env_id and sparsity_threshold > 0.0:
+            from sparse_cartpole_wrapper import SparseCartpoleRewardWrapper
+            env = SparseCartpoleRewardWrapper(env, threshold=sparsity_threshold)
+        # ──────────────────────────────────────────────────────────────────
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -122,7 +133,8 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__sp{args.sparsity_threshold}__{args.seed}__{int(time.time())}"
+
 
     if args.track:
         import wandb
@@ -148,8 +160,10 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    # In both scripts, change the SyncVectorEnv line to:
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma,
+                args.sparsity_threshold) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
